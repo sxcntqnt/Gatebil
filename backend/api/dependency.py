@@ -27,7 +27,7 @@ import torch
 from fastapi import Depends, Request
 
 from core.exceptions import ModelNotReadyError
-from model.id_detector import IDCardDetector
+from model.id_detector import IDDetector
 
 
 # ── Generic state accessor ─────────────────────────────────────────────────────
