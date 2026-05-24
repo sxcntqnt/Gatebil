@@ -20,7 +20,7 @@ from fastapi import APIRouter, Depends, Request
 
 from api.dependency import get_device_info
 from core.config import settings
-from models.schemas import HealthResponse, ModelsResponse
+from model.schemas import HealthResponse, ModelsResponse
 
 log = logging.getLogger(__name__)
 
