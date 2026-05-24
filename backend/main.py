@@ -150,10 +150,10 @@ def _register_routers(app: FastAPI) -> None:
     This is the only place route modules are imported — keeping the
     import graph flat and the startup sequence obvious.
     """
-    from app.routes.health       import router as health_router
-    from app.routes.ekyc         import router as ekyc_router
-    from app.routes.verification import router as verification_router
-    from app.routes.liveness     import router as liveness_router
+    from routes.health       import router as health_router
+    from routes.ekyc         import router as ekyc_router
+    from routes.verification import router as verification_router
+    from routes.liveness     import router as liveness_router
 
     prefix = settings.api_prefix  # "/internal/v1"
 
