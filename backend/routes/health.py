@@ -18,9 +18,9 @@ from typing import Annotated
 import torch
 from fastapi import APIRouter, Depends, Request
 
-from app.api.dependency import get_device_info
-from app.core.config import settings
-from app.models.schemas import HealthResponse, ModelsResponse
+from ..api.dependency import get_device_info
+from ..core.config import settings
+from ..models.schemas import HealthResponse, ModelsResponse
 
 log = logging.getLogger(__name__)
 
