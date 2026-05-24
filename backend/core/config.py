@@ -8,6 +8,20 @@ Loaded once at import time; every module that needs a value imports `settings`.
 Environment variables are read automatically by pydantic-settings.
 No value is hard-coded anywhere else in the codebase.
 """
+
+"""
+app.core.config
+────────────────
+Centralized runtime configuration for the entire application.
+
+Features:
+- Environment-variable driven via pydantic-settings
+- Safe filesystem path resolution using absolute project-relative paths
+- Startup validation for required ML model assets
+- Automatic temporary directory creation
+- Cached singleton settings object
+"""
+
 from functools import lru_cache
 from pathlib import Path
 
@@ -15,7 +29,31 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+# ============================================================================
+# Project Root Resolution
+# ============================================================================
+# config.py lives in:
+#   backend/core/config.py
+#
+# parent       -> backend/core
+# parent.parent -> backend
+#
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+# ML weights directory
+WEIGHTS_DIR = BASE_DIR / "resources" / "weights"
+
+# Temporary working directory
+TMP_DIR = BASE_DIR / "tmp"
+
+
 class Settings(BaseSettings):
+    """
+    Global application settings.
+
+    Values may be overridden by environment variables or a .env file.
+    """
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -23,84 +61,140 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # ── Server ────────────────────────────────────────────────────────────
-    host: str = Field("0.0.0.0", description="Bind address")
-    port: int = Field(5000, description="Listen port")
-    workers: int = Field(1, description="Uvicorn worker processes (1 on GPU)")
-    log_level: str = Field("info", description="Uvicorn / application log level")
+    # =========================================================================
+    # Server
+    # =========================================================================
+    host: str = Field(
+        default="0.0.0.0",
+        description="Bind address",
+    )
 
-    # ── Model paths ───────────────────────────────────────────────────────
-    # Resolved relative to the project root so Docker WORKDIR works cleanly.
+    port: int = Field(
+        default=5000,
+        description="Uvicorn listen port",
+    )
+
+    workers: int = Field(
+        default=1,
+        description="Worker processes (keep at 1 on GPU systems)",
+    )
+
+    log_level: str = Field(
+        default="info",
+        description="Application logging level",
+    )
+
+    # =========================================================================
+    # Model Paths
+    # =========================================================================
     frozen_model_path: Path = Field(
-        Path("../resources/weights/frozen_model.pb"),
-        description="TF1 frozen protobuf for DSNT keypoint detection",
+        default=WEIGHTS_DIR / "frozen_model.pb",
+        description="TensorFlow frozen graph for DSNT keypoint detection",
     )
+
     shape_predictor_path: Path = Field(
-        Path("../resources/weights/shape_predictor_68_face_landmarks.dat"),
-        description="dlib 68-point landmark predictor",
+        default=WEIGHTS_DIR / "shape_predictor_68_face_landmarks.dat",
+        description="dlib 68-point facial landmark predictor",
     )
+
     emotion_weights_path: Path = Field(
-        Path("..//resources/weights/emotion_weights.pt"),
-        description="Emotion classifier weights",
+        default=WEIGHTS_DIR / "emotion_weights.pt",
+        description="Emotion classifier PyTorch weights",
     )
 
-    # ── Storage ───────────────────────────────────────────────────────────
+    # =========================================================================
+    # Storage
+    # =========================================================================
     tmp_dir: Path = Field(
-        Path("tmp"),
-        description="Scratch directory for intermediate images",
+        default=TMP_DIR,
+        description="Scratch directory for temporary images/files",
     )
+
     tmp_max_age_seconds: int = Field(
-        300,
-        description="Temp files older than this are eligible for cleanup",
+        default=300,
+        description="Temporary file cleanup threshold",
     )
 
-    # ── Inference thresholds ──────────────────────────────────────────────
+    # =========================================================================
+    # Inference Thresholds
+    # =========================================================================
     face_verification_threshold: float = Field(
-        0.6,
-        description="Cosine distance threshold for VGGFace2 accept/reject",
+        default=0.6,
+        description="Cosine distance threshold for face verification",
     )
+
     liveness_blink_ear_threshold: float = Field(
-        0.25,
-        description="Eye aspect ratio below which a blink is detected",
+        default=0.25,
+        description="Blink EAR threshold",
     )
 
-    # ── Model versioning (included in every response for audit) ──────────
+    # =========================================================================
+    # Version Metadata
+    # =========================================================================
     model_version: str = Field(
-        "vggface2-2026.05",
-        description="Human-readable version tag for the face model",
+        default="vggface2-2026.05",
+        description="Face model version identifier",
     )
+
     liveness_version: str = Field(
-        "liveness-trinity-v2",
-        description="Human-readable version tag for the liveness stack",
+        default="liveness-trinity-v2",
+        description="Liveness system version identifier",
     )
 
-    # ── Internal API prefix ───────────────────────────────────────────────
+    # =========================================================================
+    # API
+    # =========================================================================
     api_prefix: str = Field(
-        "/internal/v1",
-        description="All inference routes mount under this prefix",
+        default="/internal/v1",
+        description="Internal API route prefix",
     )
 
-    @field_validator("frozen_model_path", "shape_predictor_path", "emotion_weights_path", mode="after")
+    # =========================================================================
+    # Validators
+    # =========================================================================
+    @field_validator(
+        "frozen_model_path",
+        "shape_predictor_path",
+        "emotion_weights_path",
+        mode="after",
+    )
     @classmethod
-    def _path_must_exist(cls, v: Path) -> Path:
-        # Validated at startup so a missing model file fails loudly,
-        # not silently at first request.
-        if not v.exists():
-            raise ValueError(f"Model file not found: {v.resolve()}")
-        return v
+    def validate_model_paths(cls, v: Path) -> Path:
+        """
+        Ensure all required model assets exist at startup.
+        """
+        resolved = v.resolve()
+
+        if not resolved.exists():
+            raise ValueError(f"Model file not found: {resolved}")
+
+        if not resolved.is_file():
+            raise ValueError(f"Expected a file but got: {resolved}")
+
+        return resolved
 
     @field_validator("tmp_dir", mode="after")
     @classmethod
-    def _ensure_tmp(cls, v: Path) -> Path:
-        v.mkdir(parents=True, exist_ok=True)
-        return v
+    def ensure_tmp_dir(cls, v: Path) -> Path:
+        """
+        Create temp directory automatically if missing.
+        """
+        resolved = v.resolve()
+        resolved.mkdir(parents=True, exist_ok=True)
+        return resolved
 
+
+# ============================================================================
+# Cached Singleton
+# ============================================================================
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    """Return the singleton Settings instance. Cached after first call."""
+    """
+    Return singleton settings instance.
+    """
     return Settings()
 
 
-# Module-level alias — most imports just do `from app.core.config import settings`.
+# Global settings object
 settings: Settings = get_settings()
