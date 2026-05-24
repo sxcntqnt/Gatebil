@@ -1,0 +1,108 @@
+groups:
+
+  - name: kyc_inference
+    rules:
+
+      # Circuit breaker has opened — Python service is being fast-failed.
+      # This fires within one scrape cycle of the breaker tripping.
+      - alert: KYCCircuitBreakerOpen
+        expr: kyc_circuit_breaker_state == 1
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "KYC inference circuit breaker is OPEN"
+          description: >
+            The Go service is no longer forwarding requests to the Python
+            inference service. Check kyc-python logs immediately.
+
+      # Circuit breaker is probing — recovering but not yet healthy.
+      - alert: KYCCircuitBreakerHalfOpen
+        expr: kyc_circuit_breaker_state == 2
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "KYC inference circuit breaker is half-open (probing)"
+          description: >
+            The circuit breaker is in recovery mode. Monitor closely —
+            if it does not return to 0 (closed) within a few minutes,
+            the Python service may still be degraded.
+
+      # Inference p95 latency is creeping above the job timeout budget.
+      # KYC_SERVICE_TIMEOUT default is 15s; warn at 10s to give headroom.
+      - alert: KYCInferenceHighLatency
+        expr: >
+          histogram_quantile(0.95,
+            rate(kyc_inference_request_duration_seconds_bucket[5m])
+          ) > 10
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "KYC inference p95 latency > 10s"
+          description: >
+            95th percentile inference latency is {{ $value | humanizeDuration }}.
+            At 15s it will hit the per-request timeout. Check GPU/CPU load
+            on the kyc-python service.
+
+  - name: kyc_worker_pool
+    rules:
+
+      # Queue is more than 80% full — jobs will start being rejected soon.
+      - alert: KYCQueueNearCapacity
+        expr: >
+          kyc_worker_queue_length
+          / on() group_left()
+          (kyc_worker_queue_length + 1) > 0.8
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "KYC worker queue is above 80% capacity"
+          description: >
+            Queue length is {{ $value }} jobs. At full capacity the service
+            returns 503 to new submissions. Scale worker count or inference
+            replicas.
+
+      # No active workers but queue is non-empty — possible goroutine leak.
+      - alert: KYCWorkerStarvation
+        expr: kyc_active_workers == 0 and kyc_worker_queue_length > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "KYC workers have stalled with jobs in queue"
+          description: >
+            Queue has {{ $value }} jobs but no workers are active.
+            This may indicate a goroutine deadlock or panic.
+
+      # Retry rate is spiking — indicates systemic inference instability.
+      - alert: KYCHighRetryRate
+        expr: rate(kyc_retries_total[5m]) > 2
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "KYC job retry rate is elevated"
+          description: >
+            Retry rate is {{ $value | humanize }} per second over the last 5m.
+            Check inference service health and error logs.
+
+  - name: kyc_http
+    rules:
+
+      # HTTP error rate above 5% across all KYC endpoints.
+      - alert: KYCHTTPErrorRate
+        expr: >
+          sum(rate(kyc_http_requests_total{status_code=~"5.."}[5m]))
+          /
+          sum(rate(kyc_http_requests_total[5m])) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "KYC HTTP 5xx error rate > 5%"
+          description: >
+            {{ $value | humanizePercentage }} of requests are returning 5xx.
+            This may indicate inference or database failures.

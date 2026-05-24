@@ -306,9 +306,9 @@ func (c *PythonClient) Challenge(ctx context.Context, req ChallengeRequest) (*Ch
 	}
 	defer release()
 
-	fields := map[string][]byte{"frame": req.FrameBytes}
 	var out ChallengeResult
-	// challenge and expected are form values, not file fields — handled below
+	// challenge and expected are plain text form fields alongside the binary
+	// frame — postChallenge builds the full multipart body itself.
 	if err := c.postChallenge(ctx, req, &out); err != nil {
 		return nil, err
 	}
@@ -399,4 +399,3 @@ func buildMultipart(fields map[string][]byte) (io.Reader, string, error) {
 	w.Close()
 	return &buf, w.FormDataContentType(), nil
 }
-

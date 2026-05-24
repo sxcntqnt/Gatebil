@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+	"fmt"
 
 	"sxcntqunts/kyc-service/internal/domain"
 	"sxcntqunts/kyc-service/internal/kycclient"

@@ -1,7 +1,25 @@
 global:
   scrape_interval: 15s
+  evaluation_interval: 15s
 
+# ── Alerting rules ────────────────────────────────────────────────────────────
+rule_files:
+  - "alerts.yml"
+
+# ── Scrape targets ────────────────────────────────────────────────────────────
 scrape_configs:
+
+  # Go KYC orchestration service
   - job_name: kyc-service
     static_configs:
       - targets: ["kyc-service:8080"]
+    metrics_path: /metrics
+
+  # Python inference service
+  # Exposes basic process metrics via prometheus-client (add to backend/main.py).
+  # Even without custom metrics, scraping /metrics gives CPU, memory, GC, and
+  # open file descriptors — enough to detect a stalled inference process.
+  - job_name: kyc-python
+    static_configs:
+      - targets: ["kyc-python:5000"]
+    metrics_path: /metrics
