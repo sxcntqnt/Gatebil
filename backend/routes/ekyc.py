@@ -17,10 +17,10 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, UploadFile
 
-from ..api.dependency import get_id_detector
-from ..models.id_detector import IDCardDetector
-from ..models.schemas import SmartCropResponse
-from ..pipelines.ekyc import process_id_card
+from api.dependency import get_id_detector
+from models.id_detector import IDCardDetector
+from models.schemas import SmartCropResponse
+from pipelines.ekyc import process_id_card
 
 log = logging.getLogger(__name__)
 

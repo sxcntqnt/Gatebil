@@ -16,9 +16,9 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, File, Form, UploadFile
 
-from ..api.dependency import get_liveness_detectors, LivenessDetectors
-from ..models.schemas import ChallengeResponse
-from ..pipelines.liveness import run_liveness
+from api.dependency import get_liveness_detectors, LivenessDetectors
+from models.schemas import ChallengeResponse
+from pipelines.liveness import run_liveness
 
 log = logging.getLogger(__name__)
 
