@@ -18,7 +18,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, File, UploadFile
 
 from api.dependency import get_id_detector
-from model.id_detector import IDCardDetector
+from model.id_detector import IDDetector
 from model.schemas import SmartCropResponse
 from pipeline.ekyc import process_id_card
 
@@ -40,7 +40,7 @@ router = APIRouter()
 )
 async def upload_id_card(
     file: UploadFile = File(..., description="ID card image (JPEG or PNG)"),
-    detector: Annotated[IDCardDetector, Depends(get_id_detector)] = None,
+    detector: Annotated[IDDetector, Depends(get_id_detector)] = None,
 ) -> SmartCropResponse:
     """
     Pipeline: decode → rotate → resize → DSNT keypoints → homography → write temp.
