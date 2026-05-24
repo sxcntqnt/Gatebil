@@ -26,9 +26,9 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.core.config import settings
-from app.core.exceptions import register_exception_handlers
-from app.core.loggin import configure_logging
+from core.config import settings
+from core.exceptions import register_exception_handlers
+from core.loggin import configure_logging
 
 log = logging.getLogger(__name__)
 
