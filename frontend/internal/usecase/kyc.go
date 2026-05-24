@@ -1,5 +1,5 @@
 // Package usecase contains the KYC business logic: input validation, duplicate
-// detection, job creation, enqueuing, and status queries.
+// detection, idempotency enforcement, job creation, enqueuing, and status queries.
 // It depends only on the domain, repository, and worker packages — never on HTTP.
 package usecase
 
@@ -21,22 +21,28 @@ import (
 
 // SubmitRequest is the validated input from the HTTP handler.
 type SubmitRequest struct {
-	UserID      string          `json:"user_id"`
-	CountryCode string          `json:"country_code"`
-	IDType      domain.IDType   `json:"id_type"`
-	IDNumber    string          `json:"id_number"`
-	FirstName   string          `json:"first_name"`
-	LastName    string          `json:"last_name"`
-	Tier        domain.KYCTier  `json:"tier"`
+	// IdempotencyKey is supplied by the caller to make retries safe.
+	// If empty the usecase generates one; callers should supply a stable
+	// key (e.g. hash of user_id + id_number + tier) for true idempotency.
+	IdempotencyKey string          `json:"idempotency_key"`
+	UserID         string          `json:"user_id"`
+	CountryCode    string          `json:"country_code"`
+	IDType         domain.IDType   `json:"id_type"`
+	IDNumber       string          `json:"id_number"`
+	FirstName      string          `json:"first_name"`
+	LastName       string          `json:"last_name"`
+	Tier           domain.KYCTier  `json:"tier"`
 }
 
 // SubmitResponse is returned immediately on a successful enqueue (HTTP 202).
 type SubmitResponse struct {
-	JobID       string          `json:"job_id"`
-	Status      domain.KYCStatus `json:"status"`
-	UserID      string          `json:"user_id"`
-	SubmittedAt time.Time       `json:"submitted_at"`
-	Message     string          `json:"message"`
+	JobID          string           `json:"job_id"`
+	IdempotencyKey string           `json:"idempotency_key"`
+	Status         domain.KYCStatus `json:"status"`
+	UserID         string           `json:"user_id"`
+	SubmittedAt    time.Time        `json:"submitted_at"`
+	Replayed       bool             `json:"replayed,omitempty"` // true when returning a cached result
+	Message        string           `json:"message"`
 }
 
 // ──────────────────────────────────────────────────
@@ -59,15 +65,41 @@ func New(repo repository.KYCRepository, pool *worker.Pool, logger *slog.Logger) 
 // Submit
 // ──────────────────────────────────────────────────
 
-// Submit validates the request, creates a KYC job record, and enqueues it for
-// async processing. It returns immediately with the new job ID (202 pattern).
+// Submit validates the request, enforces idempotency, creates a KYC job record,
+// and enqueues it for async processing. Returns immediately with the job ID (202 pattern).
 func (u *KYCUsecase) Submit(ctx context.Context, req SubmitRequest) (*SubmitResponse, error) {
-	// 1. Domain validation
+	// 0. Ensure idempotency key exists — generate one if the caller omitted it.
+	//    A generated key won't survive a retry, which is fine: callers who want
+	//    true replay protection must supply their own stable key.
+	if req.IdempotencyKey == "" {
+		req.IdempotencyKey = uuid.New().String()
+	}
+
+	// 1. Idempotency check — must happen before domain validation and before
+	//    any write, so a retried request always gets the same response.
+	prior, err := u.repo.FindByIdempotencyKey(ctx, req.IdempotencyKey)
+	if err == nil && prior != nil {
+		u.logger.Info("idempotency replay",
+			"idempotency_key", req.IdempotencyKey,
+			"job_id", prior.ID,
+		)
+		return &SubmitResponse{
+			JobID:          prior.ID,
+			IdempotencyKey: req.IdempotencyKey,
+			Status:         domain.StatusPending,
+			UserID:         prior.UserID,
+			SubmittedAt:    prior.SubmittedAt,
+			Replayed:       true,
+			Message:        "Idempotency replay — returning previously accepted job.",
+		}, nil
+	}
+
+	// 2. Domain validation.
 	if err := u.validate(req); err != nil {
 		return nil, err
 	}
 
-	// 2. Duplicate detection — reject if there is already an active job.
+	// 3. Duplicate detection — reject if there is already an active (non-terminal) job.
 	active, err := u.repo.GetActiveJobForUser(ctx, req.UserID)
 	if err != nil {
 		return nil, fmt.Errorf("duplicate check: %w", err)
@@ -76,35 +108,37 @@ func (u *KYCUsecase) Submit(ctx context.Context, req SubmitRequest) (*SubmitResp
 		return nil, domain.ErrDuplicateJob
 	}
 
-	// 3. Build domain job.
+	// 4. Build domain job.
 	now := time.Now().UTC()
 	job := domain.KYCJob{
-		ID:          uuid.New().String(),
-		UserID:      req.UserID,
-		CountryCode: req.CountryCode,
-		IDType:      req.IDType,
-		IDNumber:    req.IDNumber,
-		FirstName:   req.FirstName,
-		LastName:    req.LastName,
-		Tier:        req.Tier,
-		Attempt:     0,
-		SubmittedAt: now,
+		ID:             uuid.New().String(),
+		IdempotencyKey: req.IdempotencyKey,
+		UserID:         req.UserID,
+		CountryCode:    req.CountryCode,
+		IDType:         req.IDType,
+		IDNumber:       req.IDNumber,
+		FirstName:      req.FirstName,
+		LastName:       req.LastName,
+		Tier:           req.Tier,
+		Attempt:        0,
+		SubmittedAt:    now,
 	}
 
-	// 4. Persist the pending job before enqueuing (audit trail first).
+	// 5. Persist the pending job before enqueuing (audit trail always written first).
 	if err := u.repo.CreateJob(ctx, &job); err != nil {
 		return nil, fmt.Errorf("persist job: %w", err)
 	}
 
-	// 5. Enqueue into the worker pool channel (non-blocking).
+	// 6. Enqueue into the worker pool channel (non-blocking).
 	if err := u.pool.Submit(job); err != nil {
-		// Queue full — mark job as failed and surface the error.
+		// Queue full — mark failed so callers know to retry later.
 		_ = u.repo.UpdateJobStatus(ctx, job.ID, domain.StatusFailed)
 		return nil, err
 	}
 
 	u.logger.Info("kyc job submitted",
 		"job_id", job.ID,
+		"idempotency_key", job.IdempotencyKey,
 		"user_id", job.UserID,
 		"country", job.CountryCode,
 		"id_type", job.IDType,
@@ -112,11 +146,12 @@ func (u *KYCUsecase) Submit(ctx context.Context, req SubmitRequest) (*SubmitResp
 	)
 
 	return &SubmitResponse{
-		JobID:       job.ID,
-		Status:      domain.StatusPending,
-		UserID:      job.UserID,
-		SubmittedAt: now,
-		Message:     "KYC verification queued. Poll /status/{job_id} for updates.",
+		JobID:          job.ID,
+		IdempotencyKey: req.IdempotencyKey,
+		Status:         domain.StatusPending,
+		UserID:         job.UserID,
+		SubmittedAt:    now,
+		Message:        "KYC verification queued. Poll /status/{job_id} for updates.",
 	}, nil
 }
 
@@ -138,65 +173,42 @@ func (u *KYCUsecase) GetStatus(ctx context.Context, jobID string) (*domain.KYCSt
 		SubmittedAt: job.SubmittedAt,
 	}
 
-	// Attempt to enrich with result if terminal.
+	// Enrich with inference result if the job has reached a terminal state.
 	result, err := u.repo.GetResult(ctx, jobID)
 	if err == nil {
-		resp.Status = result.Status
-		resp.ResultText = result.ResultText
-		resp.Confidence = result.Confidence
-		resp.ProcessedAt = result.ProcessedAt
+		resp.Status          = result.Status
+		resp.ResultText      = result.ResultText
+		resp.Confidence      = result.Confidence
+		resp.ModelVersion    = result.ModelVersion
+		resp.LivenessVersion = result.LivenessVersion
+		resp.ProcessedAt     = result.ProcessedAt
 	} else {
-		// Job exists but result not yet written — still pending/processing.
 		resp.Status = domain.StatusPending
 	}
 
 	return resp, nil
 }
 
-// GetUserStatus returns the latest terminal KYC result for a given user.
-func (u *KYCUsecase) GetUserStatus(ctx context.Context, userID string) (*domain.KYCStatusResponse, error) {
-	result, err := u.repo.GetLatestResultForUser(ctx, userID)
+// GetStatusByUser returns the most recent KYC status for a user across all jobs.
+func (u *KYCUsecase) GetStatusByUser(ctx context.Context, userID string) (*domain.KYCStatusResponse, error) {
+	job, err := u.repo.GetLatestJobForUser(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
-	job, err := u.repo.GetJob(ctx, result.JobID)
-	if err != nil {
-		return nil, err
-	}
-	return &domain.KYCStatusResponse{
-		JobID:       result.JobID,
-		UserID:      result.UserID,
-		Status:      result.Status,
-		Tier:        job.Tier,
-		ResultText:  result.ResultText,
-		Confidence:  result.Confidence,
-		ProcessedAt: result.ProcessedAt,
-		SubmittedAt: job.SubmittedAt,
-	}, nil
+	return u.GetStatus(ctx, job.ID)
 }
 
 // ──────────────────────────────────────────────────
-// Validation
+// Validation (private)
 // ──────────────────────────────────────────────────
 
 func (u *KYCUsecase) validate(req SubmitRequest) error {
 	if req.UserID == "" {
 		return fmt.Errorf("user_id is required")
 	}
-	if req.CountryCode == "" {
-		return fmt.Errorf("country_code is required")
-	}
 	if req.IDNumber == "" {
 		return fmt.Errorf("id_number is required")
 	}
-	if req.FirstName == "" || req.LastName == "" {
-		return fmt.Errorf("first_name and last_name are required")
-	}
-	if req.Tier == "" {
-		req.Tier = domain.TierLight
-	}
-
-	// Country + ID type cross-check.
 	allowed, ok := domain.AllowedIDTypes[req.CountryCode]
 	if !ok {
 		return fmt.Errorf("unsupported country: %s", req.CountryCode)
@@ -204,6 +216,8 @@ func (u *KYCUsecase) validate(req SubmitRequest) error {
 	if !allowed[req.IDType] {
 		return domain.ErrInvalidIDType
 	}
-
+	if req.Tier != domain.TierLight && req.Tier != domain.TierFull {
+		return fmt.Errorf("tier must be kyc_light or kyc_full, got %q", req.Tier)
+	}
 	return nil
 }

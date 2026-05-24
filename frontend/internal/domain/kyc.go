@@ -17,13 +17,13 @@ type KYCStatus string
 const (
 	StatusPending    KYCStatus = "pending"    // queued, not yet dispatched
 	StatusProcessing KYCStatus = "processing" // worker picked it up
-	StatusApproved   KYCStatus = "approved"   // SmileID returned verified
-	StatusRejected   KYCStatus = "rejected"   // SmileID returned not verified
+	StatusApproved   KYCStatus = "approved"   // inference returned verified
+	StatusRejected   KYCStatus = "rejected"   // inference returned not verified
 	StatusFailed     KYCStatus = "failed"     // transient error after all retries
 )
 
 // ──────────────────────────────────────────────────
-// ID type catalogue (BCLB / Smile ID supported)
+// ID type catalogue
 // ──────────────────────────────────────────────────
 
 type IDType string
@@ -37,14 +37,14 @@ const (
 )
 
 // ──────────────────────────────────────────────────
-// KYC tier — maps to BCLB light vs full
+// KYC tier — maps to light vs full verification
 // ──────────────────────────────────────────────────
 
 type KYCTier string
 
 const (
-	TierLight KYCTier = "kyc_light"    // passengers / low-risk
-	TierFull  KYCTier = "kyc_full"     // operators / crew / NTSA-grade
+	TierLight KYCTier = "kyc_light" // passengers / low-risk
+	TierFull  KYCTier = "kyc_full"  // operators / crew / NTSA-grade
 )
 
 // ──────────────────────────────────────────────────
@@ -53,42 +53,47 @@ const (
 
 // KYCJob is the unit of work queued to the worker pool.
 type KYCJob struct {
-	ID          string    `json:"id"`           // UUID v4
-	UserID      string    `json:"user_id"`
-	CountryCode string    `json:"country_code"` // "KE", "NG", "GH"
-	IDType      IDType    `json:"id_type"`
-	IDNumber    string    `json:"id_number"`
-	FirstName   string    `json:"first_name"`
-	LastName    string    `json:"last_name"`
-	Tier        KYCTier   `json:"tier"`
-	Attempt     int       `json:"attempt"`      // retry counter
-	SubmittedAt time.Time `json:"submitted_at"`
+	ID              string    `json:"id"`               // UUID v4
+	IdempotencyKey  string    `json:"idempotency_key"`  // caller-supplied dedup key
+	UserID          string    `json:"user_id"`
+	CountryCode     string    `json:"country_code"`     // "KE", "NG", "GH"
+	IDType          IDType    `json:"id_type"`
+	IDNumber        string    `json:"id_number"`
+	FirstName       string    `json:"first_name"`
+	LastName        string    `json:"last_name"`
+	Tier            KYCTier   `json:"tier"`
+	Attempt         int       `json:"attempt"`          // retry counter
+	SubmittedAt     time.Time `json:"submitted_at"`
 }
 
 // KYCResult is the persisted outcome of a completed job.
 type KYCResult struct {
-	JobID       string    `json:"job_id"`
-	UserID      string    `json:"user_id"`
-	Status      KYCStatus `json:"status"`
-	SmileJobID  string    `json:"smile_job_id,omitempty"`
-	ResultText  string    `json:"result_text,omitempty"`
-	ResultCode  string    `json:"result_code,omitempty"`
-	Confidence  float64   `json:"confidence,omitempty"`
-	ErrorMsg    string    `json:"error,omitempty"`
-	ProcessedAt time.Time `json:"processed_at"`
-	Attempt     int       `json:"attempt"`
+	JobID           string    `json:"job_id"`
+	UserID          string    `json:"user_id"`
+	Status          KYCStatus `json:"status"`
+	InternalJobID   string    `json:"internal_job_id,omitempty"`  // ref inside Python service
+	ResultText      string    `json:"result_text,omitempty"`
+	ResultCode      string    `json:"result_code,omitempty"`
+	Confidence      float64   `json:"confidence,omitempty"`
+	ModelVersion    string    `json:"model_version,omitempty"`    // e.g. "vggface2-2026.05"
+	LivenessVersion string    `json:"liveness_version,omitempty"` // e.g. "liveness-trinity-v2"
+	ErrorMsg        string    `json:"error,omitempty"`
+	ProcessedAt     time.Time `json:"processed_at"`
+	Attempt         int       `json:"attempt"`
 }
 
 // KYCStatusResponse is the HTTP response shape for status queries.
 type KYCStatusResponse struct {
-	JobID       string    `json:"job_id"`
-	UserID      string    `json:"user_id"`
-	Status      KYCStatus `json:"status"`
-	Tier        KYCTier   `json:"tier,omitempty"`
-	ResultText  string    `json:"result_text,omitempty"`
-	Confidence  float64   `json:"confidence,omitempty"`
-	ProcessedAt time.Time `json:"processed_at,omitempty"`
-	SubmittedAt time.Time `json:"submitted_at"`
+	JobID           string    `json:"job_id"`
+	UserID          string    `json:"user_id"`
+	Status          KYCStatus `json:"status"`
+	Tier            KYCTier   `json:"tier,omitempty"`
+	ResultText      string    `json:"result_text,omitempty"`
+	Confidence      float64   `json:"confidence,omitempty"`
+	ModelVersion    string    `json:"model_version,omitempty"`
+	LivenessVersion string    `json:"liveness_version,omitempty"`
+	ProcessedAt     time.Time `json:"processed_at,omitempty"`
+	SubmittedAt     time.Time `json:"submitted_at"`
 }
 
 // ──────────────────────────────────────────────────
@@ -98,9 +103,12 @@ type KYCStatusResponse struct {
 var (
 	ErrJobNotFound      = errors.New("kyc job not found")
 	ErrDuplicateJob     = errors.New("active kyc job already exists for this user")
+	ErrIdempotentReplay = errors.New("idempotency key already used — replaying prior result")
 	ErrInvalidIDType    = errors.New("unsupported ID type for the given country")
 	ErrQueueFull        = errors.New("kyc worker queue is at capacity, try again shortly")
 	ErrJobAlreadyDone   = errors.New("kyc job is already in a terminal state")
+	ErrBackpressure     = errors.New("inference service is at concurrency limit, backing off")
+	ErrInferenceTimeout = errors.New("inference service did not respond within deadline")
 )
 
 // ──────────────────────────────────────────────────

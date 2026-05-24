@@ -18,11 +18,10 @@ type Config struct {
 	WriteTimeout    time.Duration
 	ShutdownTimeout time.Duration
 
-	// Smile ID
-	SmileAPIKey    string
-	SmilePartnerID string
-	SmileEnv       string        // "sandbox" | "production"
-	SmileTimeout   time.Duration // per-request timeout to Smile ID API
+	// Internal KYC inference service (replaces Smile ID)
+	KYCServiceURL     string        // e.g. "http://kyc-python:5000"
+	KYCServiceTimeout time.Duration // per-request timeout to the Python service
+	KYCConcurrency    int           // semaphore width — max parallel calls to Python
 
 	// PostgreSQL
 	DBDSN string
@@ -48,10 +47,11 @@ func Load() (*Config, error) {
 		WriteTimeout:    getDuration("WRITE_TIMEOUT", 30*time.Second),
 		ShutdownTimeout: getDuration("SHUTDOWN_TIMEOUT", 15*time.Second),
 
-		SmileAPIKey:    os.Getenv("SMILE_ID_API_KEY"),
-		SmilePartnerID: os.Getenv("SMILE_ID_PARTNER_ID"),
-		SmileEnv:       getEnv("SMILE_ID_ENV", "sandbox"),
-		SmileTimeout:   getDuration("SMILE_ID_TIMEOUT", 20*time.Second),
+		KYCServiceURL:     getEnv("KYC_SERVICE_URL", "http://localhost:5000"),
+		KYCServiceTimeout: getDuration("KYC_SERVICE_TIMEOUT", 15*time.Second),
+		// Default: match WorkerCount so every goroutine can make one call.
+		// Tuned down at runtime if the Python service is resource-constrained.
+		KYCConcurrency: getInt("KYC_SERVICE_CONCURRENCY", 20),
 
 		DBDSN: os.Getenv("DATABASE_DSN"),
 
@@ -71,9 +71,8 @@ func Load() (*Config, error) {
 
 func (c *Config) validate() error {
 	required := map[string]string{
-		"SMILE_ID_API_KEY":    c.SmileAPIKey,
-		"SMILE_ID_PARTNER_ID": c.SmilePartnerID,
-		"DATABASE_DSN":        c.DBDSN,
+		"DATABASE_DSN":    c.DBDSN,
+		"KYC_SERVICE_URL": c.KYCServiceURL,
 	}
 	for key, val := range required {
 		if val == "" {
@@ -83,8 +82,9 @@ func (c *Config) validate() error {
 	if c.WorkerCount < 1 || c.WorkerCount > 500 {
 		return fmt.Errorf("KYC_WORKER_COUNT must be between 1 and 500, got %d", c.WorkerCount)
 	}
-	if c.SmileEnv != "sandbox" && c.SmileEnv != "production" {
-		return fmt.Errorf("SMILE_ID_ENV must be 'sandbox' or 'production', got %q", c.SmileEnv)
+	if c.KYCConcurrency < 1 || c.KYCConcurrency > c.WorkerCount {
+		return fmt.Errorf("KYC_SERVICE_CONCURRENCY must be between 1 and KYC_WORKER_COUNT (%d), got %d",
+			c.WorkerCount, c.KYCConcurrency)
 	}
 	return nil
 }
