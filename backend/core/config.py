@@ -32,15 +32,15 @@ class Settings(BaseSettings):
     # ── Model paths ───────────────────────────────────────────────────────
     # Resolved relative to the project root so Docker WORKDIR works cleanly.
     frozen_model_path: Path = Field(
-        Path("model/frozen_model.pb"),
+        Path("../model/frozen_model.pb"),
         description="TF1 frozen protobuf for DSNT keypoint detection",
     )
     shape_predictor_path: Path = Field(
-        Path("services/liveness_detection/landmarks/shape_predictor_68_face_landmarks.dat"),
+        Path("../services/liveness_detection/landmarks/shape_predictor_68_face_landmarks.dat"),
         description="dlib 68-point landmark predictor",
     )
     emotion_weights_path: Path = Field(
-        Path("services/liveness_detection/landmarks/emotion_weights.pt"),
+        Path("../services/liveness_detection/landmarks/emotion_weights.pt"),
         description="Emotion classifier weights",
     )
 
