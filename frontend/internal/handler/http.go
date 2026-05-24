@@ -14,6 +14,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"sxcntqunts/kyc-service/internal/domain"
+	"sxcntqunts/kyc-service/internal/kycclient"
 	"sxcntqunts/kyc-service/internal/metrics"
 	"sxcntqunts/kyc-service/internal/usecase"
 	"sxcntqunts/kyc-service/internal/worker"
@@ -27,6 +28,7 @@ import (
 type Server struct {
 	uc      *usecase.KYCUsecase
 	pool    *worker.Pool
+	kycCli  kycclient.KYCClient // for /models and /inference-health proxy
 	metrics *metrics.KYCMetrics
 	logger  *slog.Logger
 	mux     *http.ServeMux
@@ -36,10 +38,18 @@ type Server struct {
 func New(
 	uc *usecase.KYCUsecase,
 	pool *worker.Pool,
+	kycCli kycclient.KYCClient,
 	m *metrics.KYCMetrics,
 	logger *slog.Logger,
 ) *Server {
-	s := &Server{uc: uc, pool: pool, metrics: m, logger: logger, mux: http.NewServeMux()}
+	s := &Server{
+		uc:      uc,
+		pool:    pool,
+		kycCli:  kycCli,
+		metrics: m,
+		logger:  logger,
+		mux:     http.NewServeMux(),
+	}
 	s.routes()
 	return s
 }
@@ -50,17 +60,20 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) routes() {
-	// Health
+	// Health & readiness
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
 	s.mux.HandleFunc("GET /readyz", s.handleReady)
 
-	// Metrics (Prometheus scrape endpoint)
+	// Prometheus scrape
 	s.mux.Handle("GET /metrics", promhttp.Handler())
 
 	// KYC API
 	s.mux.HandleFunc("POST /api/v1/kyc/submit", s.handleSubmit)
 	s.mux.HandleFunc("GET /api/v1/kyc/status/{jobID}", s.handleGetJobStatus)
 	s.mux.HandleFunc("GET /api/v1/kyc/user/{userID}/status", s.handleGetUserStatus)
+
+	// Inference service introspection (proxied from Python service)
+	s.mux.HandleFunc("GET /api/v1/kyc/models", s.handleModels)
 }
 
 // ──────────────────────────────────────────────────
@@ -70,11 +83,20 @@ func (s *Server) routes() {
 // handleSubmit accepts a KYC verification request, enqueues it, and returns 202.
 //
 //	POST /api/v1/kyc/submit
+//
+// Callers should supply an Idempotency-Key header for safe retries. Without
+// one the service generates a key, but a generated key won't survive a client
+// retry and duplicate jobs may result.
 func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	var req usecase.SubmitRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
 		return
+	}
+
+	// Idempotency-Key from header takes precedence over the JSON body field.
+	if hk := r.Header.Get("Idempotency-Key"); hk != "" {
+		req.IdempotencyKey = hk
 	}
 
 	// Default tier to light when omitted.
@@ -84,21 +106,50 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.uc.Submit(r.Context(), req)
 	if err != nil {
-		switch {
-		case errors.Is(err, domain.ErrDuplicateJob):
-			writeError(w, http.StatusConflict, err.Error())
-		case errors.Is(err, domain.ErrInvalidIDType):
-			writeError(w, http.StatusUnprocessableEntity, err.Error())
-		case errors.Is(err, domain.ErrQueueFull):
-			writeError(w, http.StatusServiceUnavailable, err.Error())
-		default:
-			s.logger.Error("submit error", "err", err)
-			writeError(w, http.StatusInternalServerError, "internal error")
-		}
+		s.mapSubmitError(w, err)
+		return
+	}
+
+	// A replayed idempotent response is a success, but signal it clearly.
+	// Return 200 (not 202) so callers know no new work was enqueued.
+	if resp.Replayed {
+		writeJSON(w, http.StatusOK, resp)
 		return
 	}
 
 	writeJSON(w, http.StatusAccepted, resp)
+}
+
+// mapSubmitError translates domain / infrastructure errors to HTTP status codes.
+func (s *Server) mapSubmitError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, domain.ErrDuplicateJob):
+		writeError(w, http.StatusConflict, err.Error())
+
+	case errors.Is(err, domain.ErrIdempotentReplay):
+		// Should not reach here (usecase returns a result, not an error),
+		// but handle defensively.
+		writeError(w, http.StatusOK, err.Error())
+
+	case errors.Is(err, domain.ErrInvalidIDType):
+		writeError(w, http.StatusUnprocessableEntity, err.Error())
+
+	case errors.Is(err, domain.ErrQueueFull):
+		w.Header().Set("Retry-After", "5")
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+
+	case errors.Is(err, domain.ErrBackpressure):
+		// Python inference layer is saturated — ask the client to back off.
+		w.Header().Set("Retry-After", "10")
+		writeError(w, http.StatusServiceUnavailable, "inference layer is under load, retry shortly")
+
+	case errors.Is(err, domain.ErrInferenceTimeout):
+		writeError(w, http.StatusGatewayTimeout, "inference service timed out")
+
+	default:
+		s.logger.Error("submit error", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+	}
 }
 
 // handleGetJobStatus returns the current state of a single KYC job.
@@ -135,7 +186,7 @@ func (s *Server) handleGetUserStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := s.uc.GetUserStatus(r.Context(), userID)
+	resp, err := s.uc.GetStatusByUser(r.Context(), userID)
 	if err != nil {
 		if errors.Is(err, domain.ErrJobNotFound) {
 			writeError(w, http.StatusNotFound, "no KYC record found for user")
@@ -149,18 +200,49 @@ func (s *Server) handleGetUserStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// handleModels proxies the Python inference service's /internal/v1/models endpoint.
+// Useful for dashboards, readiness checks, and debugging GPU state.
+//
+//	GET /api/v1/kyc/models
+func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
+	status, err := s.kycCli.Models(r.Context())
+	if err != nil {
+		s.logger.Error("models probe failed", "err", err)
+		writeError(w, http.StatusBadGateway, "inference service unreachable")
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
 // handleHealth is the liveness probe — always 200 if the process is running.
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// handleReady is the readiness probe — checks the worker queue is not overloaded.
-func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
+// handleReady is the readiness probe — checks the worker queue is not overloaded
+// and the inference service is reachable.
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	qLen := s.pool.QueueLen()
-	body := map[string]any{
-		"status":    "ok",
-		"queue_len": qLen,
+
+	inferenceOK := true
+	if err := s.kycCli.Health(r.Context()); err != nil {
+		s.logger.Warn("inference health check failed", "err", err)
+		inferenceOK = false
 	}
+
+	body := map[string]any{
+		"status":        "ok",
+		"queue_len":     qLen,
+		"inference_ok":  inferenceOK,
+	}
+
+	// Return 503 if inference is down — k3s will stop routing traffic here.
+	if !inferenceOK {
+		body["status"] = "degraded"
+		writeJSON(w, http.StatusServiceUnavailable, body)
+		return
+	}
+
 	writeJSON(w, http.StatusOK, body)
 }
 
@@ -220,13 +302,14 @@ func (s *Server) metricsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// cors sets permissive CORS headers for local development.
-// Tighten allowed origins in production.
+// cors sets permissive CORS headers.
+// TODO: replace "*" with an env-driven allowlist before production.
 func (s *Server) cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Request-ID")
+		w.Header().Set("Access-Control-Allow-Headers",
+			"Content-Type, Authorization, X-Request-ID, Idempotency-Key")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return

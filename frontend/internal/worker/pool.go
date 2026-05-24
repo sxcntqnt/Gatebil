@@ -1,260 +1,329 @@
-// Package worker implements the async KYC processing engine.
-//
-// Architecture:
-//   - A fixed-size pool of goroutines drains a single buffered job channel.
-//   - Each worker calls the Smile ID SDK within a per-job context deadline.
-//   - Transient failures are retried with exponential back-off + jitter.
-//   - Terminal results are persisted via the repository and metrics updated.
-//   - Graceful shutdown: when the service context is cancelled the pool drains
-//     in-flight jobs then exits; the WaitGroup blocks until all workers are done.
+// Package worker implements the bounded goroutine pool that processes KYC jobs
+// asynchronously. It consumes domain.KYCJob values from a buffered channel and
+// dispatches them to the KYCClient inference layer.
 package worker
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"log/slog"
-	"math"
-	"math/rand"
 	"sync"
 	"time"
 
-	smileid "github.com/nutcas3/smileid-go"
 	"sxcntqunts/kyc-service/internal/domain"
+	"sxcntqunts/kyc-service/internal/kycclient"
 	"sxcntqunts/kyc-service/internal/metrics"
 	"sxcntqunts/kyc-service/internal/repository"
 )
 
 // ──────────────────────────────────────────────────
+// Pool configuration
+// ──────────────────────────────────────────────────
+
+// PoolConfig holds all tunable knobs for the worker pool.
+type PoolConfig struct {
+	WorkerCount    int           // goroutines consuming the job channel
+	QueueDepth     int           // buffered channel capacity
+	MaxRetries     int           // max attempts before marking StatusFailed
+	RetryBaseDelay time.Duration // exponential backoff seed (e.g. 2s → 4s → 8s)
+	JobTimeout     time.Duration // context deadline applied to each job attempt
+}
+
+// ──────────────────────────────────────────────────
 // Pool
 // ──────────────────────────────────────────────────
 
-// Pool manages a bounded set of goroutines that process KYC jobs from a channel.
+// Pool is a bounded set of goroutines that drain the jobs channel.
+// It is safe for concurrent use after Start has been called.
 type Pool struct {
-	cfg     PoolConfig
-	client  *smileid.Client
-	repo    repository.KYCRepository
-	metrics *metrics.KYCMetrics
-	logger  *slog.Logger
+	cfg    PoolConfig
+	jobs   chan domain.KYCJob
 
-	jobs chan domain.KYCJob // buffered work queue
-	wg   sync.WaitGroup
+	// kycClient is the only dependency the pool holds on the inference layer.
+	// Swap PythonClient for any other KYCClient implementation freely.
+	kycClient kycclient.KYCClient
+
+	repo   repository.KYCRepository
+	m      *metrics.KYCMetrics
+	logger *slog.Logger
+	wg     sync.WaitGroup
 }
 
-// PoolConfig holds tuning knobs for the worker pool.
-type PoolConfig struct {
-	WorkerCount    int
-	QueueDepth     int
-	MaxRetries     int
-	RetryBaseDelay time.Duration
-	JobTimeout     time.Duration
-}
-
-// New allocates the pool and its internal job channel but does not start workers.
-// Call Start(ctx) to begin processing.
+// New constructs a Pool. Call Start to begin processing.
 func New(
 	cfg PoolConfig,
-	client *smileid.Client,
+	kycClient kycclient.KYCClient,
 	repo repository.KYCRepository,
 	m *metrics.KYCMetrics,
 	logger *slog.Logger,
 ) *Pool {
 	return &Pool{
-		cfg:     cfg,
-		client:  client,
-		repo:    repo,
-		metrics: m,
-		logger:  logger,
-		jobs:    make(chan domain.KYCJob, cfg.QueueDepth),
+		cfg:       cfg,
+		jobs:      make(chan domain.KYCJob, cfg.QueueDepth),
+		kycClient: kycClient,
+		repo:      repo,
+		m:         m,
+		logger:    logger,
 	}
 }
 
-// Start launches cfg.WorkerCount goroutines. It returns immediately; workers
-// run until ctx is cancelled or the jobs channel is closed.
+// Start launches WorkerCount goroutines. They block on the jobs channel
+// until it is closed (via Wait) or ctx is cancelled.
 func (p *Pool) Start(ctx context.Context) {
-	for i := range p.cfg.WorkerCount {
+	for i := 0; i < p.cfg.WorkerCount; i++ {
 		p.wg.Add(1)
-		go p.runWorker(ctx, i)
+		go p.worker(ctx)
 	}
-	p.logger.Info("kyc worker pool started", "workers", p.cfg.WorkerCount, "queue_depth", p.cfg.QueueDepth)
 }
 
-// Submit enqueues a job for async processing. It returns ErrQueueFull if the
-// channel buffer is exhausted so the HTTP layer can respond with 503.
+// Submit enqueues a job. Returns domain.ErrQueueFull immediately if the
+// channel buffer is exhausted (non-blocking).
 func (p *Pool) Submit(job domain.KYCJob) error {
 	select {
 	case p.jobs <- job:
-		p.metrics.JobsSubmitted.Inc()
-		p.metrics.WorkerQueueLen.Set(float64(len(p.jobs)))
+		p.m.JobsSubmitted.Inc()
+		p.m.WorkerQueueLen.Set(float64(len(p.jobs)))
 		return nil
 	default:
 		return domain.ErrQueueFull
 	}
 }
 
-// Wait blocks until all workers have exited. Call after cancelling the context.
+// QueueLen returns the current number of jobs waiting in the channel.
+func (p *Pool) QueueLen() int {
+	return len(p.jobs)
+}
+
+// Wait closes the jobs channel and blocks until all goroutines have exited.
+// Call once, after cancelling the service context.
 func (p *Pool) Wait() {
-	close(p.jobs) // signal workers to drain and exit
+	close(p.jobs)
 	p.wg.Wait()
-	p.logger.Info("kyc worker pool shut down cleanly")
 }
 
-// QueueLen returns the current number of pending jobs in the channel.
-func (p *Pool) QueueLen() int { return len(p.jobs) }
-
 // ──────────────────────────────────────────────────
-// Worker goroutine
+// Worker loop
 // ──────────────────────────────────────────────────
 
-func (p *Pool) runWorker(ctx context.Context, id int) {
+func (p *Pool) worker(ctx context.Context) {
 	defer p.wg.Done()
-	log := p.logger.With("worker_id", id)
-	log.Debug("worker started")
-
 	for job := range p.jobs {
-		p.metrics.WorkerQueueLen.Set(float64(len(p.jobs)))
-		p.metrics.ActiveWorkers.Inc()
-
-		p.processWithRetry(ctx, job, log)
-
-		p.metrics.ActiveWorkers.Dec()
+		p.m.WorkerQueueLen.Set(float64(len(p.jobs)))
+		p.processWithRetry(ctx, job)
 	}
-	log.Debug("worker exiting")
 }
 
-// processWithRetry handles a single job including exponential-backoff retry.
-func (p *Pool) processWithRetry(ctx context.Context, job domain.KYCJob, log *slog.Logger) {
-	start := time.Now()
-	log = log.With("job_id", job.ID, "user_id", job.UserID)
-
-	// Mark as processing in the DB.
-	if err := p.repo.UpdateJobStatus(ctx, job.ID, domain.StatusProcessing); err != nil {
-		log.Error("failed to set job processing status", "err", err)
-		// Continue anyway — the job is worth attempting.
-	}
-
+// processWithRetry runs the job up to MaxRetries times with exponential backoff.
+// Backpressure signals from the inference layer are treated as soft retries and
+// do NOT count against the failure budget.
+func (p *Pool) processWithRetry(ctx context.Context, job domain.KYCJob) {
 	var (
-		result *domain.KYCResult
-		err    error
+		attempt      = 0
+		softRetries  = 0 // backpressure-only retries; unbounded but rate-limited
+		maxSoft      = 10
 	)
 
-	for attempt := 1; attempt <= p.cfg.MaxRetries; attempt++ {
-		if attempt > 1 {
-			delay := backoff(p.cfg.RetryBaseDelay, attempt)
-			log.Info("retrying kyc job", "attempt", attempt, "delay", delay)
-			p.metrics.RetriesTotal.Inc()
-
-			select {
-			case <-time.After(delay):
-			case <-ctx.Done():
-				log.Warn("context cancelled during retry backoff")
-				p.persist(ctx, job, failedResult(job, attempt, "service shutdown during retry"))
-				return
-			}
+	for {
+		// Hard failure budget exhausted.
+		if attempt >= p.cfg.MaxRetries {
+			p.logger.Error("job exceeded retry limit",
+				"job_id", job.ID,
+				"attempts", attempt,
+			)
+			p.finalise(ctx, job, domain.StatusFailed, nil, "exceeded max retries")
+			return
 		}
 
-		jobCtx, cancel := context.WithTimeout(ctx, p.cfg.JobTimeout)
-		result, err = p.callSmileID(jobCtx, job, attempt)
-		cancel()
+		// Context cancelled (service shutting down).
+		if ctx.Err() != nil {
+			p.logger.Info("worker context cancelled, dropping job", "job_id", job.ID)
+			return
+		}
+
+		err := p.processOnce(ctx, job, attempt)
 
 		if err == nil {
-			break // success
+			// Success — nothing more to do; processOnce already persisted the result.
+			return
 		}
 
-		log.Warn("smile id call failed", "attempt", attempt, "err", err)
+		// ── Classify the error ────────────────────────────────────────────
 
-		// If service context was cancelled, stop retrying.
-		if ctx.Err() != nil {
-			result = failedResult(job, attempt, "service shutdown")
-			break
+		if errors.Is(err, domain.ErrBackpressure) {
+			// Inference layer is saturated. Back off briefly, but don't burn
+			// a retry from the hard budget — the job itself is fine.
+			softRetries++
+			if softRetries > maxSoft {
+				p.logger.Warn("too many backpressure retries, marking failed",
+					"job_id", job.ID, "soft_retries", softRetries)
+				p.finalise(ctx, job, domain.StatusFailed, nil, "inference backpressure limit")
+				return
+			}
+			delay := p.cfg.RetryBaseDelay * time.Duration(softRetries)
+			p.logger.Warn("inference backpressure, backing off",
+				"job_id", job.ID,
+				"soft_retry", softRetries,
+				"delay", delay,
+			)
+			p.sleep(ctx, delay)
+			continue
 		}
+
+		if errors.Is(err, domain.ErrInferenceTimeout) {
+			// Timeout is a hard failure — counts against the retry budget.
+			attempt++
+			p.m.RetriesTotal.Inc()
+			delay := p.cfg.RetryBaseDelay * (1 << attempt)
+			p.logger.Warn("inference timeout, retrying",
+				"job_id", job.ID, "attempt", attempt, "delay", delay)
+			p.sleep(ctx, delay)
+			continue
+		}
+
+		// Generic transient error — exponential backoff, count against budget.
+		attempt++
+		job.Attempt = attempt
+		p.m.RetriesTotal.Inc()
+		delay := p.cfg.RetryBaseDelay * (1 << attempt)
+		p.logger.Warn("job failed, retrying",
+			"job_id", job.ID,
+			"attempt", attempt,
+			"delay", delay,
+			"err", err,
+		)
+		p.sleep(ctx, delay)
 	}
-
-	if err != nil && result == nil {
-		result = failedResult(job, p.cfg.MaxRetries, err.Error())
-	}
-
-	p.persist(ctx, job, result)
-
-	elapsed := time.Since(start).Seconds()
-	p.metrics.JobDuration.Observe(elapsed)
-	p.metrics.JobsProcessed.WithLabelValues(string(result.Status)).Inc()
-
-	log.Info("kyc job finished", "status", result.Status, "elapsed_s", fmt.Sprintf("%.3f", elapsed))
 }
 
-// callSmileID dispatches the actual verification request to the Smile ID SDK.
-func (p *Pool) callSmileID(ctx context.Context, job domain.KYCJob, attempt int) (*domain.KYCResult, error) {
-	req := smileid.KYCRequest{
-		CountryCode: job.CountryCode,
-		IDType:      string(job.IDType),
-		IDNumber:    job.IDNumber,
-		FirstName:   job.FirstName,
-		LastName:    job.LastName,
+// processOnce executes a single inference attempt for the job.
+func (p *Pool) processOnce(ctx context.Context, job domain.KYCJob, attempt int) error {
+	jobCtx, cancel := context.WithTimeout(ctx, p.cfg.JobTimeout)
+	defer cancel()
+
+	p.m.ActiveWorkers.Inc()
+	defer p.m.ActiveWorkers.Dec()
+
+	// Mark in-progress.
+	if err := p.repo.UpdateJobStatus(jobCtx, job.ID, domain.StatusProcessing); err != nil {
+		p.logger.Warn("could not set processing status", "job_id", job.ID, "err", err)
 	}
 
 	t0 := time.Now()
-	resp, err := p.client.KYC.VerifyUser(ctx, req)
-	p.metrics.SmileLatency.Observe(time.Since(t0).Seconds())
+
+	// ── Call the inference service ────────────────────────────────────────
+	// The job currently carries metadata only (no image bytes at this layer).
+	// Image bytes are provided upstream by the HTTP handler via a presigned URL
+	// or passed directly for the initial multipart phase.
+	//
+	// For TierLight: verify only.
+	// For TierFull:  smart-crop, then verify, then challenge.
+	result, err := p.runInference(jobCtx, job)
+
+	p.m.InferenceLatency.Observe(time.Since(t0).Seconds())
 
 	if err != nil {
-		return nil, fmt.Errorf("smileid.VerifyUser: %w", err)
+		return err
 	}
 
-	// Map SmileID response → domain result.
-	// The SDK's KYCResponse fields are read directly; adapt as the library evolves.
+	// ── Persist result ────────────────────────────────────────────────────
+	result.Attempt = attempt
+	result.ProcessedAt = time.Now().UTC()
+	if err := p.repo.SaveResult(jobCtx, result); err != nil {
+		return fmt.Errorf("save result: %w", err)
+	}
+
+	p.m.JobsProcessed.WithLabelValues(string(result.Status)).Inc()
+	p.m.JobDuration.Observe(time.Since(t0).Seconds())
+
+	p.logger.Info("job completed",
+		"job_id", job.ID,
+		"status", result.Status,
+		"score", result.Confidence,
+		"model", result.ModelVersion,
+	)
+	return nil
+}
+
+// runInference calls the appropriate KYCClient methods based on job tier.
+func (p *Pool) runInference(ctx context.Context, job domain.KYCJob) (*domain.KYCResult, error) {
+	// NOTE: at this layer the worker has metadata only.
+	// Image bytes come from the submit path — stored in object storage (future)
+	// or passed in-band (current multipart flow). For now we pass empty bytes
+	// and rely on the Python service having the images from the prior /id-card call.
+	// This will be replaced cleanly when the object-storage URL pattern lands.
+	req := kycclient.VerifyRequest{
+		// SelfieURL / IDCardURL will replace these once MinIO is wired.
+		SelfieBytes: nil, // TODO: fetch from object store by job.ID
+		IDCardBytes: nil,
+	}
+
+	verifyResult, err := p.kycClient.Verify(ctx, req)
+	if err != nil {
+		if isBackpressure(err) {
+			return nil, domain.ErrBackpressure
+		}
+		if isTimeout(err) {
+			return nil, domain.ErrInferenceTimeout
+		}
+		return nil, err
+	}
+
 	status := domain.StatusRejected
-	if resp.Verified {
+	if verifyResult.Verified {
 		status = domain.StatusApproved
 	}
 
 	return &domain.KYCResult{
-		JobID:       job.ID,
-		UserID:      job.UserID,
-		Status:      status,
-		SmileJobID:  resp.SmileJobID,
-		ResultText:  resp.ResultText,
-		ResultCode:  resp.ResultCode,
-		Confidence:  resp.Confidence,
-		Attempt:     attempt,
-		ProcessedAt: time.Now(),
+		JobID:           job.ID,
+		UserID:          job.UserID,
+		Status:          status,
+		InternalJobID:   verifyResult.InternalJobID,
+		Confidence:      verifyResult.Score,
+		ModelVersion:    verifyResult.ModelVersion,
+		LivenessVersion: verifyResult.LivenessVersion,
 	}, nil
 }
 
-// persist writes the final result to the database and syncs the job status.
-func (p *Pool) persist(ctx context.Context, job domain.KYCJob, result *domain.KYCResult) {
-	log := p.logger.With("job_id", job.ID)
+// ── Terminal state helpers ────────────────────────────────────────────────────
 
-	if err := p.repo.UpsertResult(ctx, result); err != nil {
-		log.Error("failed to persist kyc result", "err", err)
-	}
-	if err := p.repo.UpdateJobStatus(ctx, job.ID, result.Status); err != nil {
-		log.Error("failed to update job status after completion", "err", err)
-	}
-}
-
-// ──────────────────────────────────────────────────
-// Helpers
-// ──────────────────────────────────────────────────
-
-// backoff returns exponential back-off with ±25% random jitter.
-func backoff(base time.Duration, attempt int) time.Duration {
-	exp := float64(base) * math.Pow(2, float64(attempt-1))
-	jitter := (rand.Float64()*0.5 - 0.25) * exp // ±25%
-	d := time.Duration(exp + jitter)
-	// Cap at 60 seconds to avoid excessive waits.
-	if d > 60*time.Second {
-		d = 60 * time.Second
-	}
-	return d
-}
-
-func failedResult(job domain.KYCJob, attempt int, reason string) *domain.KYCResult {
-	return &domain.KYCResult{
+func (p *Pool) finalise(ctx context.Context, job domain.KYCJob, status domain.KYCStatus, verifyResult *kycclient.VerifyResult, errMsg string) {
+	result := &domain.KYCResult{
 		JobID:       job.ID,
 		UserID:      job.UserID,
-		Status:      domain.StatusFailed,
-		ErrorMsg:    reason,
-		Attempt:     attempt,
-		ProcessedAt: time.Now(),
+		Status:      status,
+		ErrorMsg:    errMsg,
+		ProcessedAt: time.Now().UTC(),
+		Attempt:     job.Attempt,
 	}
+	if verifyResult != nil {
+		result.ModelVersion    = verifyResult.ModelVersion
+		result.LivenessVersion = verifyResult.LivenessVersion
+		result.Confidence      = verifyResult.Score
+	}
+	if err := p.repo.SaveResult(ctx, result); err != nil {
+		p.logger.Error("could not persist terminal result",
+			"job_id", job.ID, "err", err)
+	}
+	p.m.JobsProcessed.WithLabelValues(string(status)).Inc()
+}
+
+// ── Utility ───────────────────────────────────────────────────────────────────
+
+// sleep blocks for d or returns early when ctx is cancelled.
+func (p *Pool) sleep(ctx context.Context, d time.Duration) {
+	select {
+	case <-time.After(d):
+	case <-ctx.Done():
+	}
+}
+
+func isBackpressure(err error) bool {
+	return errors.Is(err, domain.ErrBackpressure) ||
+		err.Error() == "kyc inference concurrency limit reached" ||
+		err.Error() == "kyc inference circuit breaker is open"
+}
+
+func isTimeout(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, domain.ErrInferenceTimeout)
 }
