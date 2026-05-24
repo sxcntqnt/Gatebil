@@ -63,7 +63,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from app.models.id_detector import IDDetector, KeypointResult
+from model.id_detector import IDDetector, KeypointResult
 
 log = logging.getLogger(__name__)
 
