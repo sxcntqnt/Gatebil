@@ -13,4 +13,9 @@ tqdm
 Flask
 keras
 matplotlib
-
+onnx 
+onnxruntime-gpu 
+insightface 
+fastapi 
+uvicorn 
+pydantic
