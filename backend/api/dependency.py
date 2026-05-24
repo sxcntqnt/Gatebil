@@ -26,8 +26,8 @@ from typing import Annotated
 import torch
 from fastapi import Depends, Request
 
-from app.core.exceptions import ModelNotReadyError
-from app.models.id_detector import IDCardDetector
+from core.exceptions import ModelNotReadyError
+from models.id_detector import IDCardDetector
 
 
 # ── Generic state accessor ─────────────────────────────────────────────────────
