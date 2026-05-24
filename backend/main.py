@@ -150,10 +150,13 @@ def _load_models(app: FastAPI, device: torch.device) -> None:
     # does not bear the kernel compilation overhead (~200-400ms on GPU).
     log.info("loading IDDetector (PyTorch) …")
     from app.models.id_detector import IDDetector
+
     app.state.id_detector = IDDetector.from_checkpoint(
         checkpoint_path=settings.id_detector_checkpoint,
         device=device,
+    confidence_threshold=settings.id_detector_confidence_threshold,
     )
+
     app.state.id_detector.warmup()
 
 
