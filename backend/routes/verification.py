@@ -19,7 +19,7 @@ from fastapi import APIRouter, Depends, File, UploadFile
 
 from api.dependency import get_mtcnn, get_verif_model
 from model.schemas import VerifyResponse
-from pipelines.verification import verify_faces
+from pipeline.verification import verify_faces
 
 log = logging.getLogger(__name__)
 

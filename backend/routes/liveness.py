@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, File, Form, UploadFile
 
 from api.dependency import get_liveness_detectors, LivenessDetectors
 from model.schemas import ChallengeResponse
-from pipelines.liveness import run_liveness
+from pipeline.liveness import run_liveness
 
 log = logging.getLogger(__name__)
 
