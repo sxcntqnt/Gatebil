@@ -1,3 +1,4 @@
+# main.py
 """
 app.main
 ────────
@@ -15,6 +16,38 @@ This file is ONLY allowed to:
 No inference logic, no model code, no business rules belong here.
 Every import from app.services.* or app.pipelines.* lives behind
 a function call so the import graph stays readable.
+
+──────────────────────────────────────────────────────────────────────
+CHANGELOG
+──────────────────────────────────────────────────────────────────────
+
+- Replaced TF1 IDCardDetector with PyTorch IDDetector.
+    Previously:
+        from app.models.id_detector import IDCardDetector
+        app.state.id_detector = IDCardDetector(settings.frozen_model_path)
+    Now:
+        from app.models.id_detector import IDDetector
+        app.state.id_detector = IDDetector.from_checkpoint(
+            settings.id_detector_checkpoint
+        )
+    This eliminates the TensorFlow runtime dependency, the frozen-graph
+    load (~3s), and all GPU/CUDA driver warnings emitted by TF on CPU
+    machines. The TF session is no longer opened and no longer needs
+    to be explicitly closed in _unload_models.
+
+- Device resolution centralised.
+    `device` is resolved once at the top of _load_models and passed
+    to every model constructor. Added Apple MPS (M-series) fallback
+    between CUDA and CPU so the service runs natively on dev machines.
+
+- Warmup call added after IDDetector load.
+    Runs 3 dummy forward passes to compile CUDA kernels before the
+    first real request bears that cost.
+
+- _unload_models updated.
+    IDDetector.close() moves the model to CPU and clears the CUDA
+    cache. PyTorch models have no session to close; the comment
+    referencing a TF session is removed.
 """
 from __future__ import annotations
 
@@ -33,6 +66,24 @@ from core.loggin import configure_logging
 log = logging.getLogger(__name__)
 
 
+# ── Device resolution ──────────────────────────────────────────────────────────
+
+def _resolve_device() -> torch.device:
+    """
+    Pick the best available compute device.
+
+    Priority:
+        CUDA  → NVIDIA GPU, full production path.
+        MPS   → Apple Silicon, native acceleration on dev machines.
+        CPU   → fallback; all models support CPU inference.
+    """
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -44,14 +95,16 @@ async def lifespan(app: FastAPI):
     app.state is the only place models live — route handlers retrieve
     them via the dependency functions in app.api.dependency.
     """
-    _load_models(app)
+    device = _resolve_device()
+    _load_models(app, device)
     log.info(
         "all models ready",
         extra={
             "model_version":    settings.model_version,
             "liveness_version": settings.liveness_version,
+            "device":           str(device),
             "gpu":              torch.cuda.is_available(),
-            "cuda":             torch.version.cuda,
+            "cuda_version":     torch.version.cuda or "n/a",
         },
     )
     yield
@@ -59,25 +112,23 @@ async def lifespan(app: FastAPI):
     log.info("inference service shut down cleanly")
 
 
-def _load_models(app: FastAPI) -> None:
+def _load_models(app: FastAPI, device: torch.device) -> None:
     """
     Initialise every model and attach it to app.state.
-    Import order matters: heavier models (VGGFace2, TF graph) load last
-    so a failure in a lighter model (MTCNN, dlib) is reported first.
+
+    Import order: lighter models first so a failure in a lightweight model
+    (MTCNN, dlib) is reported before spending time loading heavy ones
+    (VGGFace2, IDDetector backbone).
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # ── MTCNN face detector ────────────────────────────────────────────────
     log.info("loading MTCNN …")
-    from services.face_detection.mtcnn import MTCNN  # old path, kept until service layer migrates
+    from services.face_detection.mtcnn import MTCNN
     app.state.mtcnn = MTCNN(device=device)
 
-    # ── VGGFace2 verification model ────────────────────────────────────────
-    log.info("loading VGGFace2 …")
-    from services.verification_models import VGGFace2
-    app.state.verif_model = VGGFace2.load_model(device=device)
-
     # ── Liveness detectors (dlib + PyTorch) ───────────────────────────────
+    # Loaded before VGGFace2 / IDDetector: dlib is lightweight and
+    # its failure should not be shadowed by a heavier model timeout.
     log.info("loading liveness detectors …")
     from services.liveness_detection.blink_detection import BlinkDetector
     from services.liveness_detection.face_orientation import FaceOrientationDetector
@@ -87,20 +138,40 @@ def _load_models(app: FastAPI) -> None:
     app.state.orient_detector = FaceOrientationDetector()
     app.state.emotion_pred    = EmotionPredictor(device=device)
 
-    # ── DSNT TF keypoint detector for ID card corners ─────────────────────
-    log.info("loading IDCardDetector (TF frozen graph) …")
-    from app.models.id_detector import IDCardDetector
-    app.state.id_detector = IDCardDetector(settings.frozen_model_path)
+    # ── VGGFace2 verification model ────────────────────────────────────────
+    log.info("loading VGGFace2 …")
+    from services.verification_models import VGGFace2
+    app.state.verif_model = VGGFace2.load_model(device=device)
+
+    # ── PyTorch ID card keypoint detector ─────────────────────────────────
+    # Replaces the previous TF1 frozen-graph IDCardDetector.
+    # Loads a checkpoint containing IDCardModel weights + metadata.
+    # warmup() pre-compiles CUDA kernels so the first real request
+    # does not bear the kernel compilation overhead (~200-400ms on GPU).
+    log.info("loading IDDetector (PyTorch) …")
+    from app.models.id_detector import IDDetector
+    app.state.id_detector = IDDetector.from_checkpoint(
+        checkpoint_path=settings.id_detector_checkpoint,
+        device=device,
+    )
+    app.state.id_detector.warmup()
 
 
 def _unload_models(app: FastAPI) -> None:
-    """Release resources that require explicit cleanup."""
+    """
+    Release resources that require explicit cleanup on shutdown.
+
+    IDDetector.close() moves the model to CPU, deletes the module,
+    and calls torch.cuda.empty_cache() to release VRAM immediately.
+
+    All other PyTorch models (VGGFace2, EmotionPredictor, MTCNN) are
+    released when app.state is garbage-collected — no explicit step needed.
+
+    dlib C++ predictors are managed by Python GC automatically.
+    """
     detector: object = getattr(app.state, "id_detector", None)
     if detector is not None:
-        detector.close()  # closes the TF session
-
-    # PyTorch models are GC'd; nothing explicit needed.
-    # dlib predictors are C++ objects; Python GC handles them.
+        detector.close()
 
 
 # ── Application factory ────────────────────────────────────────────────────────
@@ -120,7 +191,7 @@ def create_app() -> FastAPI:
             f"{settings.api_prefix} and are not exposed publicly."
         ),
         lifespan=lifespan,
-        # Disable the default /docs in prod; enable via env if needed.
+        # /docs is only available in debug mode; never exposed in production.
         docs_url="/docs" if settings.log_level.lower() == "debug" else None,
         redoc_url=None,
     )
@@ -129,8 +200,8 @@ def create_app() -> FastAPI:
     register_exception_handlers(app)
 
     # ── Middleware ─────────────────────────────────────────────────────────
-    # CORS is permissive here because the Go service is the only caller and
-    # the Python service is never exposed to the public internet.
+    # CORS is permissive: the Go service is the only caller and this service
+    # is never exposed directly to the public internet.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -147,7 +218,7 @@ def create_app() -> FastAPI:
 def _register_routers(app: FastAPI) -> None:
     """
     Mount every route blueprint under the configured API prefix.
-    This is the only place route modules are imported — keeping the
+    This is the only place route modules are imported, keeping the
     import graph flat and the startup sequence obvious.
     """
     from routes.health       import router as health_router
@@ -176,6 +247,5 @@ if __name__ == "__main__":
         port=settings.port,
         workers=settings.workers,
         log_level=settings.log_level.lower(),
-        # Reload only makes sense in development; never in production.
-        reload=False,
+        reload=False,  # never reload in production
     )
