@@ -1,3 +1,5 @@
 nosos/
 frontend/.env
 frontend/bin/*
+backend/.env
+backend/resources/weights/*
