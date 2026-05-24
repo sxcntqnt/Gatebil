@@ -2,7 +2,7 @@ import cv2 as cv
 import torch
 from PIL import Image
 
-from services.facenet.models.mtcnn import MTCNN
+from services.face_detection.mtcnn import MTCNN
 from utils.distance import *
 from utils.functions import *
 from verification_models import VGGFace2
