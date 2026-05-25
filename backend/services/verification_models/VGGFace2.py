@@ -3,7 +3,9 @@ import os
 import torch
 from torch import nn
 from torch.nn import functional as F
+from pathlib import Path
 
+RESOURCE_DIR = Path(__file__).resolve().parents[2] / "resources" / "weights"
 
 class BasicConv2d(nn.Module):
 
@@ -281,21 +283,38 @@ class InceptionResnetV1(nn.Module):
         return x
 
 
-def load_model(pretrained = 'weights/vggface2_weights.pt', device = 'cpu'):
+def load_model(
+    pretrained: str = "vggface2_weights.pt",
+    device: str | torch.device = "cpu",
+):
     if isinstance(device, str):
-        if (device == 'cuda' or device == 'gpu') and torch.cuda.is_available():
-            device = torch.device(device)
+        if device in ("cuda", "gpu") and torch.cuda.is_available():
+            device = torch.device("cuda")
         else:
-            device = torch.device('cpu')
-    
+            device = torch.device("cpu")
+
     model = InceptionResnetV1().to(device)
     model.eval()
+
     if pretrained:
-        state_dict_path = os.path.join(os.path.dirname(__file__), pretrained)
-        model.load_state_dict(torch.load(state_dict_path, map_location= 'cpu'))
-        print('Weights loaded successfully from path:', state_dict_path)
-        print('====================================================')
-        
+        state_dict_path = RESOURCE_DIR / pretrained
+
+        if not state_dict_path.exists():
+            raise FileNotFoundError(
+                f"Missing VGGFace2 weights: {state_dict_path}"
+            )
+
+        model.load_state_dict(
+            torch.load(
+                str(state_dict_path),
+                map_location="cpu",
+                weights_only=True,
+            )
+        )
+
+        print(f"Weights loaded successfully from path: {state_dict_path}")
+        print("====================================================")
+
     return model
 
 if __name__ == '__main__':
