@@ -82,7 +82,7 @@ import torch.nn.functional as F
 from torchvision import transforms
 from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
 
-from .dsnt import DSNT, DSNTOutput
+from tasks.dsnt import DSNT, DSNTOutput
 
 log = logging.getLogger(__name__)
 
