@@ -27,11 +27,11 @@ import logging
 
 import numpy as np
 
-from app.core.config import settings
-from app.core.exceptions import StorageError
-from app.services.face.verification import verify_pair
-from app.services.storage import temp
-from app.utils.image import bytes_to_bgr
+from core.config import settings
+from core.exceptions import StorageError
+from services.face.verification import verify_pair
+from services.storage import temp
+from utils.image import bytes_to_bgr
 
 log = logging.getLogger(__name__)
 
