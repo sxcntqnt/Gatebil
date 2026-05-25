@@ -15,7 +15,7 @@ class BlinkDetector():
     def __init__(self):
         # cargar modelo para deteccion de puntos de ojos
         landmark_path = RESOURCE_DIR / "shape_predictor_68_face_landmarks.dat"
-        self.predictor_eyes = dlib.shape_predictor(landmark_path)
+        self.predictor_eyes = dlib.shape_predictor(str(landmark_path))
 
         self.EYE_AR_THRESH = 0.25
         self.EYE_AR_CONSEC_FRAMES = 3
