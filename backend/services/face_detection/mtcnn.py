@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import os
 from typing import Optional, Union, List, Tuple
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -61,7 +62,7 @@ _SELECTION_METHODS = frozenset({
     'largest_over_threshold',
 })
 
-
+RESOURCE_DIR = Path(__file__).resolve().parents[2] / "resources" / "data"
 # ---------------------------------------------------------------------------
 # PNet — Proposal Network
 # ---------------------------------------------------------------------------
@@ -90,9 +91,8 @@ class PNet(nn.Module):
         self.conv4_2 = nn.Conv2d(32, 4, kernel_size=1)
 
         if pretrained:
-            state_dict_path = os.path.join(
-                os.path.dirname(__file__), 'data', 'pnet.pt'
-            )
+            state_dict_path = RESOURCE_DIR / "pnet.pt"
+
             self.load_state_dict(
                 torch.load(state_dict_path, map_location='cpu', weights_only=True)
             )
@@ -143,9 +143,8 @@ class RNet(nn.Module):
         self.dense5_2 = nn.Linear(128, 4)
 
         if pretrained:
-            state_dict_path = os.path.join(
-                os.path.dirname(__file__), 'data', 'rnet.pt'
-            )
+            state_dict_path = RESOURCE_DIR / "rnet.pt"
+
             self.load_state_dict(
                 torch.load(state_dict_path, map_location='cpu', weights_only=True)
             )
@@ -199,9 +198,8 @@ class ONet(nn.Module):
         self.dense6_3 = nn.Linear(256, 10)
 
         if pretrained:
-            state_dict_path = os.path.join(
-                os.path.dirname(__file__), 'data', 'onet.pt'
-            )
+            state_dict_path = RESOURCE_DIR / "onet.pt"
+
             self.load_state_dict(
                 torch.load(state_dict_path, map_location='cpu', weights_only=True)
             )
