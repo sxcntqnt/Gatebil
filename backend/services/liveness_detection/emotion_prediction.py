@@ -7,7 +7,7 @@ from PIL import Image
 
 from pathlib import Path
 
-RESOURCE_DIR = Path(__file__).resolve().parents[2] / "resources" / "data"
+RESOURCE_DIR = Path(__file__).resolve().parents[2] / "resources" / "weights"
 
 class EmotionDetectionModel(nn.Module):
     "VGG-Face"

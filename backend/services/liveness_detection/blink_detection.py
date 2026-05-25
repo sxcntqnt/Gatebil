@@ -7,7 +7,7 @@ import torch
 import math
 from pathlib import Path
 
-RESOURCE_DIR = Path(__file__).resolve().parents[2] / "resources" / "data"
+RESOURCE_DIR = Path(__file__).resolve().parents[2] / "resources" / "weights"
 
 class BlinkDetector():
     '''A class for detecting eye blinking in facial images'''
