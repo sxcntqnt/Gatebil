@@ -29,7 +29,7 @@ import numpy as np
 
 from core.config import settings
 from core.exceptions import StorageError
-from services.face.verification import verify_pair
+from services.face_verification import verify_pair
 from services.storage import temp
 from utils.image import bytes_to_bgr
 
