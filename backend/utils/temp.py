@@ -30,8 +30,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from app.core.config import settings
-from app.core.exceptions import StorageError
+from core.config import settings
+from core.exceptions import StorageError
 
 log = logging.getLogger(__name__)
 
