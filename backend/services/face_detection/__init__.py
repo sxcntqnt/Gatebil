@@ -22,7 +22,7 @@ Lower-level access
     from face_detection.inception_resnet_v1 import InceptionResnetV1
 """
 
-from .face_detector import FaceDetector, DetectionResult, EmbeddingResult
+from .face_detection import FaceDetector, DetectionResult, EmbeddingResult
 from .mtcnn import MTCNN, PNet, RNet, ONet
 from .inception_resnet_v1 import (
     InceptionResnetV1,
