@@ -5,13 +5,16 @@ from imutils import face_utils
 import os
 import torch
 import math
+from pathlib import Path
+
+RESOURCE_DIR = Path(__file__).resolve().parents[2] / "resources" / "weights"
 
 class BlinkDetector():
     '''A class for detecting eye blinking in facial images'''
     
     def __init__(self):
         # cargar modelo para deteccion de puntos de ojos
-        landmark_path = os.path.join(os.path.dirname(__file__), 'landmarks/shape_predictor_68_face_landmarks.dat')
+        landmark_path = RESOURCE_DIR / "shape_predictor_68_face_landmarks.dat"
         self.predictor_eyes = dlib.shape_predictor(landmark_path)
 
         self.EYE_AR_THRESH = 0.25

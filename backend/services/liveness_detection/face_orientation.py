@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 
+
 class FaceOrientationDetector():
     """This class detects the orientation of a face in an image."""
     def __init__(self):

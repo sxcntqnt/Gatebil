@@ -1,10 +1,13 @@
 import torch
 from torch import nn 
 from torch.nn import functional as F
-import os
 from torchvision import transforms as T
 import numpy as np
 from PIL import Image
+
+from pathlib import Path
+
+RESOURCE_DIR = Path(__file__).resolve().parents[2] / "resources" / "weights"
 
 class EmotionDetectionModel(nn.Module):
     "VGG-Face"
@@ -62,7 +65,7 @@ class EmotionDetectionModel(nn.Module):
     
 class EmotionPredictor():
     
-    def __init__(self, pretrained = 'landmarks/emotion_weights.pt', device = 'cpu', img_size = (64,64), classes = ['smile','surprise', 'neutral']):
+    def __init__(self, pretrained = 'emotion_weights.pt', device = 'cpu', img_size = (64,64), classes = ['smile','surprise', 'neutral']):
         
         if isinstance(device, str):
             if (device == 'cuda' or device == 'gpu') and torch.cuda.is_available():
@@ -75,10 +78,10 @@ class EmotionPredictor():
         self.model.eval() 
         
         if pretrained:
-            state_dict_path = os.path.join(os.path.dirname(__file__), pretrained)
-            self.model.load_state_dict(torch.load(state_dict_path, map_location= 'cpu'))
-            # print('Weights loaded successfully from path:', state_dict_path)
-            # print('====================================================')
+            state_dict_path = RESOURCE_DIR / pretrained
+            self.model.load_state_dict(torch.load(state_dict_path, map_location= 'cpu', weights_only=True))
+            print('Weights loaded successfully from path:', state_dict_path)
+            print('====================================================')
         
         self.img_size = img_size
         self.classes = np.array(classes) 
