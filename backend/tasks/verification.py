@@ -30,7 +30,7 @@ import numpy as np
 from core.config import settings
 from core.exceptions import StorageError
 from services.face_verification.face_verification import verify_pair
-from services.storage import temp
+from utils import temp
 from utils.image import bytes_to_bgr
 
 log = logging.getLogger(__name__)

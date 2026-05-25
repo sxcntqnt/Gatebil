@@ -46,9 +46,9 @@ import torch
 from imutils import face_utils
 from PIL import Image
 
-from app.api.dependency import LivenessDetectors
-from app.core.config import settings
-from app.core.exceptions import LivenessError, NoFaceDetectedError
+from api.dependency import LivenessDetectors
+from core.config import settings
+from core.exceptions import LivenessError, NoFaceDetectedError
 
 log = logging.getLogger(__name__)
 
