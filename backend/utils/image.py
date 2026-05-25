@@ -15,7 +15,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from app.core.exceptions import ImageDecodeError
+from core.exceptions import ImageDecodeError
 
 
 # ── Decode ─────────────────────────────────────────────────────────────────────
