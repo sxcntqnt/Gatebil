@@ -27,9 +27,9 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from app.core.config import settings
-from app.core.exceptions import NoFaceDetectedError
-from app.utils.image import cosine_similarity
+from core.config import settings
+from core.exceptions import NoFaceDetectedError
+from utils.image import cosine_similarity
 
 log = logging.getLogger(__name__)
 
