@@ -20,7 +20,7 @@ from fastapi import APIRouter, Depends, File, UploadFile
 from api.dependency import get_id_detector
 from model.id_detector import IDDetector
 from model.schemas import SmartCropResponse
-from pipeline.ekyc import process_id_card
+from services.ekyc import process_id_card
 
 log = logging.getLogger(__name__)
 
