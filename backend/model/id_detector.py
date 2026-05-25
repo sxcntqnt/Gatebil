@@ -500,7 +500,7 @@ class IDDetector:
 
         # map_location='cpu' keeps checkpoint loading device-agnostic.
         # The model is moved to `device` after loading.
-        ckpt = torch.load(path, map_location='cpu', weights_only=True)
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
 
         if 'model_state_dict' not in ckpt:
             raise KeyError(
