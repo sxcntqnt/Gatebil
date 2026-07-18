@@ -1,4 +1,5 @@
 nosos/
+frontend/.prod.env
 frontend/.env
 frontend/bin/*
 backend/.env

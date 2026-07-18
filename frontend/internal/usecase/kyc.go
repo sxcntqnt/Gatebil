@@ -21,17 +21,16 @@ import (
 
 // SubmitRequest is the validated input from the HTTP handler.
 type SubmitRequest struct {
-	// IdempotencyKey is supplied by the caller to make retries safe.
-	// If empty the usecase generates one; callers should supply a stable
-	// key (e.g. hash of user_id + id_number + tier) for true idempotency.
-	IdempotencyKey string          `json:"idempotency_key"`
-	UserID         string          `json:"user_id"`
-	CountryCode    string          `json:"country_code"`
-	IDType         domain.IDType   `json:"id_type"`
-	IDNumber       string          `json:"id_number"`
-	FirstName      string          `json:"first_name"`
-	LastName       string          `json:"last_name"`
-	Tier           domain.KYCTier  `json:"tier"`
+        IdempotencyKey string          `json:"idempotency_key"`
+        UserID         string          `json:"user_id"`
+        CountryCode    string          `json:"country_code"`
+        IDType         domain.IDType   `json:"id_type"`
+        IDNumber       string          `json:"id_number"`
+        FirstName      string          `json:"first_name"`
+        LastName       string          `json:"last_name"`
+        Tier           domain.KYCTier  `json:"tier"`
+        SelfieURL      string          `json:"selfie_url"`
+        IDCardURL      string          `json:"id_card_url"`
 }
 
 // SubmitResponse is returned immediately on a successful enqueue (HTTP 202).
@@ -120,6 +119,8 @@ func (u *KYCUsecase) Submit(ctx context.Context, req SubmitRequest) (*SubmitResp
 		FirstName:      req.FirstName,
 		LastName:       req.LastName,
 		Tier:           req.Tier,
+                SelfieURL:      req.SelfieURL,
+                IDCardURL:      req.IDCardURL,
 		Attempt:        0,
 		SubmittedAt:    now,
 	}
@@ -203,21 +204,27 @@ func (u *KYCUsecase) GetStatusByUser(ctx context.Context, userID string) (*domai
 // ──────────────────────────────────────────────────
 
 func (u *KYCUsecase) validate(req SubmitRequest) error {
-	if req.UserID == "" {
-		return fmt.Errorf("user_id is required")
-	}
-	if req.IDNumber == "" {
-		return fmt.Errorf("id_number is required")
-	}
-	allowed, ok := domain.AllowedIDTypes[req.CountryCode]
-	if !ok {
-		return fmt.Errorf("unsupported country: %s", req.CountryCode)
-	}
-	if !allowed[req.IDType] {
-		return domain.ErrInvalidIDType
-	}
-	if req.Tier != domain.TierLight && req.Tier != domain.TierFull {
-		return fmt.Errorf("tier must be kyc_light or kyc_full, got %q", req.Tier)
-	}
-	return nil
+        if req.UserID == "" {
+                return fmt.Errorf("user_id is required")
+        }
+        if req.IDNumber == "" {
+                return fmt.Errorf("id_number is required")
+        }
+        if req.SelfieURL == "" {
+                return fmt.Errorf("selfie_url is required")
+        }
+        if req.IDCardURL == "" {
+                return fmt.Errorf("id_card_url is required")
+        }
+        allowed, ok := domain.AllowedIDTypes[req.CountryCode]
+        if !ok {
+                return fmt.Errorf("unsupported country: %s", req.CountryCode)
+        }
+        if !allowed[req.IDType] {
+                return domain.ErrInvalidIDType
+        }
+        if req.Tier != domain.TierLight && req.Tier != domain.TierFull {
+                return fmt.Errorf("tier must be kyc_light or kyc_full, got %q", req.Tier)
+        }
+        return nil
 }

@@ -37,9 +37,9 @@ The system supports two verification tiers:
                                                 │ (timeout · semaphore · circuit breaker)
                          ┌──────────────────────▼──────────────┐
                          │      Python Inference Service        │
-                         │  app/main.py  (FastAPI + uvicorn)   │
+                         │  main.py  (FastAPI + uvicorn)        │
                          │                                     │
-                         │  /id-card   →  DSNT TF keypoints    │
+                         │  /id-card   →  keypoints             │
                          │               + homography warp      │
                          │                                     │
                          │  /verify    →  VGGFace2 embeddings  │
@@ -51,13 +51,16 @@ The system supports two verification tiers:
                          │                                     │
                          │  /health    →  liveness probe        │
                          │  /models    →  model load state      │
-                         └─────────────────────────────────────┘
-                                                │
-                                         MinIO / S3
-                                   (future: image storage)
+                         └──────────────────┬──────────────────┘
+                                            │
+                                     Cloudflare R2
+                              (selfie + ID card images,
+                               fetched via presigned URLs)
 ```
 
 The Go service is the only externally visible component. The Python service is an internal inference kernel — never exposed directly to clients.
+
+Image bytes never cross the Go ↔ Python boundary. The SvelteKit frontend uploads selfie and ID card images directly to Cloudflare R2, then passes presigned GET URLs through Go to Python, which fetches the bytes itself.
 
 ---
 
@@ -82,38 +85,47 @@ kyc-service/                        Go orchestration service
 └── .env.example                    All environment variables documented
 
 kyc-python/                         Python inference service
-├── app/
-│   ├── main.py                     Entrypoint — lifespan, routers, middleware only
-│   ├── core/
-│   │   ├── config.py               Pydantic-settings, model paths, thresholds
-│   │   ├── exceptions.py           Domain exception hierarchy + FastAPI handlers
-│   │   └── loggin.py               Structured JSON logging
-│   ├── api/
-│   │   └── dependency.py           FastAPI dependencies for model singletons
-│   ├── models/
-│   │   ├── id_detector.py          DSNT TF frozen graph wrapper + session lifecycle
-│   │   └── schemas.py              Pydantic request/response shapes (matches Go structs)
-│   ├── routes/
-│   │   ├── health.py               GET /health  GET /models
-│   │   ├── ekyc.py                 POST /id-card
-│   │   ├── verification.py         POST /verify
-│   │   └── liveness.py             POST /challenge
-│   ├── pipelines/                  ← in progress
-│   │   ├── ekyc.py                 Crop orchestration: decode → keypoints → warp
-│   │   ├── verification.py         Verify: embeddings → cosine similarity
-│   │   └── liveness.py             Liveness: blink / orientation / emotion
-│   ├── services/                   ← in progress
-│   │   ├── id_card/
-│   │   │   ├── preprocessing.py    Rotate, resize, decode for model input
-│   │   │   ├── inference.py        TF session runner
-│   │   │   ├── homography.py       Perspective warp from keypoints
-│   │   │   └── cropper.py          End-to-end smart-crop orchestration
-│   │   ├── face/
-│   │   │   └── verification.py     VGGFace2 embedding extraction + comparison
-│   │   └── storage/
-│   │       └── temp.py             Temp file lifecycle management
-│   └── utils/
-│       └── image.py                Decode, resize, distance helpers
+├── main.py                         Entrypoint — lifespan, routers, middleware only
+├── core/
+│   ├── config.py                   Pydantic-settings, model paths, thresholds
+│   ├── exceptions.py               Domain exception hierarchy + FastAPI handlers
+│   └── loggin.py                   Structured JSON logging
+├── api/
+│   └── dependency.py               FastAPI dependencies for model singletons
+├── model/
+│   ├── id_detector.py              PyTorch ID card keypoint detector
+│   └── schemas.py                  Pydantic request/response shapes (URL-based)
+├── routes/
+│   ├── health.py                   GET /health  GET /models
+│   ├── ekyc.py                     POST /id-card   (JSON, R2 URL)
+│   ├── verification.py             POST /verify    (JSON, R2 URLs)
+│   └── liveness.py                 POST /challenge (multipart — live video frame)
+├── tasks/                          Pipeline orchestration (decode → infer → format)
+│   ├── dsnt.py                     Keypoint model task wrapper
+│   ├── liveliness.py               Liveness challenge dispatch
+│   └── verification.py             verify_faces(): decode → verify_pair → format
+├── services/
+│   ├── id_card/
+│   │   ├── ekyc.py                 process_id_card(): decode → keypoints → homography → EKYCResult
+│   │   ├── id_cropper.py
+│   │   ├── id_homography.py
+│   │   └── id_preprocessing.py
+│   ├── face_detection/             MTCNN (facenet-pytorch, vendored)
+│   ├── face_verification/
+│   │   └── face_verification.py    extract_embedding / compare_faces / verify_pair
+│   ├── liveness_detection/
+│   │   ├── blink_detection.py
+│   │   ├── emotion_prediction.py
+│   │   └── face_orientation.py
+│   └── verification_models/
+│       ├── VGGFace.py
+│       └── VGGFace2.py             VGGFace2.load_model()
+└── utils/
+    ├── image.py                    Decode, resize, distance helpers, bytes_to_bgr
+    ├── temp.py                     Slot storage + fetch_bytes() for R2 URLs
+    ├── distance.py
+    ├── functions.py
+    └── plot.py
 ```
 
 ---
@@ -125,17 +137,17 @@ kyc-python/                         Python inference service
 | File | Status | Notes |
 |---|---|---|
 | `config/config.go` | ✅ | Smile ID removed; `KYC_SERVICE_URL`, `KYC_SERVICE_TIMEOUT`, `KYC_SERVICE_CONCURRENCY` added |
-| `domain/kyc.go` | ✅ | `IdempotencyKey`, `ModelVersion`, `LivenessVersion`, `ErrBackpressure` |
-| `kycclient/client.go` | ✅ | `KYCClient` interface; `PythonClient` with semaphore + circuit breaker |
-| `usecase/kyc.go` | ✅ | Idempotency check before duplicate check; `GetStatusByUser` |
+| `domain/kyc.go` | ✅ | `IdempotencyKey`, `ModelVersion`, `LivenessVersion`, `ErrBackpressure`, `SelfieURL`/`IDCardURL` on `KYCJob` |
+| `kycclient/client.go` | ✅ | `KYCClient` interface; `PythonClient` with semaphore + circuit breaker; `Verify`/`SmartCrop` are JSON+URL, `Challenge` stays multipart |
+| `usecase/kyc.go` | ✅ | Idempotency check before duplicate check; `GetStatusByUser`; `SelfieURL`/`IDCardURL` required on submit |
 | `handler/http.go` | ✅ | `Idempotency-Key` header; `/models` proxy; `ErrBackpressure` → 503 + `Retry-After` |
 | `repository/postgres.go` | ✅ | `FindByIdempotencyKey`, `SaveResult` (upsert), `model_version` column |
-| `worker/pool.go` | ✅ | Backpressure retries do not burn the hard retry budget |
+| `worker/pool.go` | ✅ | Backpressure retries do not burn the hard retry budget; `runInference` passes URLs straight from `KYCJob`, no object-store fetch on the Go side |
 | `metrics/metrics.go` | ✅ | `InferenceLatency`, `CircuitBreakerState`, `IdempotencyReplays` |
 | `cmd/server/main.go` | ✅ | `waitForInference()` startup gate; logs full model state on boot |
 | `monitoring/alerts.yml` | ✅ | Six rules: circuit breaker, latency p95, queue, worker starvation, HTTP errors |
 
-### Python Service — Foundation Complete, Services/Pipelines Pending
+### Python Service — Core Complete
 
 | Layer | File | Status |
 |---|---|---|
@@ -143,20 +155,19 @@ kyc-python/                         Python inference service
 | Core | `core/config.py` | ✅ Pydantic-settings, path validation at startup |
 | Core | `core/exceptions.py` | ✅ Domain hierarchy + FastAPI handlers |
 | Core | `core/loggin.py` | ✅ Structured JSON, silences noisy libs |
-| Models | `models/id_detector.py` | ✅ DSNT TF graph class, `close()` on shutdown |
-| Models | `models/schemas.py` | ✅ Mirrors Go `kycclient` structs exactly |
+| Model | `model/id_detector.py` | ✅ PyTorch keypoint detector, `close()` on shutdown |
+| Model | `model/schemas.py` | ✅ URL-based request schemas (`SmartCropRequest`, `VerifyRequest`) |
 | API | `api/dependency.py` | ✅ Model singletons via `app.state`, `LivenessDetectors` bundle |
-| Utils | `utils/image.py` | ✅ Decode, resize, cosine/euclidean distance |
+| Utils | `utils/image.py` | ✅ Decode, resize, cosine/euclidean distance, `bytes_to_bgr` |
+| Utils | `utils/temp.py` | ✅ Slot storage + `fetch_bytes()` for presigned R2 URLs |
 | Routes | `routes/health.py` | ✅ `/health` + `/models` |
-| Routes | `routes/ekyc.py` | ✅ `/id-card` |
-| Routes | `routes/verification.py` | ✅ `/verify`, `id_image` optional |
-| Routes | `routes/liveness.py` | ✅ `/challenge`, challenge type validated by `Literal` |
-| Pipelines | `pipelines/ekyc.py` | 🔲 Next |
-| Pipelines | `pipelines/verification.py` | 🔲 Next |
-| Pipelines | `pipelines/liveness.py` | 🔲 Next |
-| Services | `services/id_card/` | 🔲 Next |
-| Services | `services/face/verification.py` | 🔲 Next |
-| Services | `services/storage/temp.py` | 🔲 Next |
+| Routes | `routes/ekyc.py` | ✅ `/id-card` — JSON `{id_card_url}`, fetches from R2, standalone preview/debug endpoint |
+| Routes | `routes/verification.py` | ✅ `/verify` — JSON `{selfie_url, id_card_url}`, rectifies fresh per request, no cached-fallback path |
+| Routes | `routes/liveness.py` | ✅ `/challenge`, challenge type validated by `Literal`, stays multipart (live video frame) |
+| Task | `tasks/verification.py` | ✅ `verify_faces()` — decode → `verify_pair` → format; temp-slot fallback removed |
+| Service | `services/id_card/ekyc.py` | ✅ `process_id_card()` — decode → keypoints → homography → `EKYCResult` |
+| Service | `services/face_verification/face_verification.py` | ✅ `extract_embedding` / `compare_faces` / `verify_pair` (BGR in, cosine similarity out) |
+| Pipeline | `tasks/liveliness.py` | 🔲 Next |
 
 ---
 
@@ -195,11 +206,17 @@ Model readiness probe. Reports each model's load state and the active GPU.
 
 ### ID Card Smart-Crop
 
+Standalone preview/debug endpoint. Not used by `/verify`, which rectifies its own copy per request.
+
 ```
 POST /internal/v1/id-card
-Content-Type: multipart/form-data
+Content-Type: application/json
+```
 
-file: <image bytes>   # JPEG or PNG, landscape phone capture
+```json
+{
+  "id_card_url": "https://<r2-presigned-url>"
+}
 ```
 
 ```json
@@ -215,10 +232,14 @@ file: <image bytes>   # JPEG or PNG, landscape phone capture
 
 ```
 POST /internal/v1/verify
-Content-Type: multipart/form-data
+Content-Type: application/json
+```
 
-selfie:   <image bytes>   # required
-id_image: <image bytes>   # optional — falls back to last /id-card output
+```json
+{
+  "selfie_url":  "https://<r2-presigned-url>",
+  "id_card_url": "https://<r2-presigned-url>"
+}
 ```
 
 ```json
@@ -231,6 +252,8 @@ id_image: <image bytes>   # optional — falls back to last /id-card output
   "internal_job_id":  ""
 }
 ```
+
+Both `selfie_url` and `id_card_url` are required. The ID card is rectified fresh on every call — there is no fallback to a cached prior result, since the worker pool calls this endpoint concurrently across jobs and shared temp state isn't request-scoped.
 
 ### Liveness Challenge
 
@@ -251,11 +274,15 @@ expected:  <string>                   # orientation label or emotion label; igno
 }
 ```
 
+This route stays multipart — it's a live video frame from the liveness SDK, not an object stored in R2.
+
 ---
 
 ## Go Service API Reference
 
 ### Submit a KYC Job
+
+The client (SvelteKit frontend) uploads the selfie and ID card images directly to Cloudflare R2, then submits presigned GET URLs to Go — the Go service never receives image bytes.
 
 ```
 POST /api/v1/kyc/submit
@@ -271,7 +298,9 @@ Idempotency-Key: <uuid>    # recommended for safe client retries
   "id_number":    "12345678",
   "first_name":   "Amina",
   "last_name":    "Wanjiru",
-  "tier":         "kyc_light"
+  "tier":         "kyc_light",
+  "selfie_url":   "https://<r2-presigned-url>",
+  "id_card_url":  "https://<r2-presigned-url>"
 }
 ```
 
@@ -365,15 +394,30 @@ GET /metrics    # Prometheus scrape endpoint
 | Variable | Default | Description |
 |---|---|---|
 | `PORT` | `5000` | Uvicorn listen port |
-| `WORKERS` | `1` | Uvicorn worker processes (keep at 1 on GPU — models are not fork-safe) |
+| `WORKERS` | `1` | Uvicorn worker processes (keep at 1 on GPU — models are not fork-safe). Note: this limits multiprocessing, not async concurrency — FastAPI still serves multiple in-flight requests per worker, which is why `/verify` never relies on shared temp state |
 | `LOG_LEVEL` | `info` | `debug` also enables `/docs` Swagger UI |
-| `FROZEN_MODEL_PATH` | `model/frozen_model.pb` | DSNT TF frozen graph |
+| `FROZEN_MODEL_PATH` | `model/frozen_model.pb` | Legacy TF keypoint model path, if still in use |
 | `SHAPE_PREDICTOR_PATH` | `services/liveness_detection/landmarks/shape_predictor_68_face_landmarks.dat` | dlib 68-point predictor |
 | `EMOTION_WEIGHTS_PATH` | `services/liveness_detection/landmarks/emotion_weights.pt` | Emotion classifier |
 | `TMP_DIR` | `tmp` | Scratch directory for intermediate images |
-| `FACE_VERIFICATION_THRESHOLD` | `0.6` | Cosine distance threshold for accept/reject |
+| `FACE_VERIFICATION_THRESHOLD` | `0.6` | Cosine similarity threshold for accept/reject |
 | `MODEL_VERSION` | `vggface2-2026.05` | Included in every verification response for audit |
 | `LIVENESS_VERSION` | `liveness-trinity-v2` | Included in every verification response for audit |
+
+The Python service holds no object-storage credentials of its own — it only ever fetches a presigned URL it's handed, via `utils/temp.fetch_bytes()`.
+
+### Object Storage (Cloudflare R2)
+
+R2 credentials and bucket config live in the **SvelteKit frontend repo's** `.env` — neither gatebill (Go) nor the Python inference service ever holds R2 credentials or constructs an R2 endpoint. They only ever receive short-lived presigned GET URLs.
+
+| Variable | Description |
+|---|---|
+| `PRIVATE_R2_ACCOUNT_ID` | Cloudflare account ID. Used to build the S3-compatible endpoint: `https://<PRIVATE_R2_ACCOUNT_ID>.r2.cloudflarestorage.com`. This endpoint is only ever used server-side inside `src/lib/server/r2.ts` — it is never sent to the browser. |
+| `PRIVATE_R2_ACCESS_KEY_ID` | R2 API access key |
+| `PRIVATE_R2_SECRET_ACCESS_KEY` | R2 API secret key |
+| `PRIVATE_R2_BUCKET` | Bucket name (private — not publicly readable) |
+
+Flow: the SvelteKit `+page.server.ts` action uploads the selfie and ID card to the bucket via `PutObjectCommand`, then calls `getSignedUrl` to generate a presigned `GetObjectCommand` URL (default 1hr TTL). That URL — not the account ID, not the bucket name — is what actually gets sent to gatebill and, from there, to the Python service. Neither downstream service needs to know the R2 endpoint exists.
 
 ---
 
@@ -384,7 +428,7 @@ The Go service protects the Python inference service with three concentric layer
 ```
 Worker goroutine
     │
-    ├── context.WithTimeout(15s)      ← kills a hung TF session
+    ├── context.WithTimeout(15s)      ← kills a hung inference call
     │
     ├── semaphore (KYC_SERVICE_CONCURRENCY)
     │       └── returns ErrBackpressure immediately if full
@@ -434,19 +478,36 @@ Backpressure from the inference layer (semaphore full or breaker open) is treate
 
 ## Roadmap
 
-### Immediate (pipelines and services layer)
-- `app/pipelines/ekyc.py` — decode → rotate → keypoints → homography → write temp
-- `app/pipelines/verification.py` — embeddings → cosine comparison
-- `app/pipelines/liveness.py` — blink / orientation / emotion dispatch
-- `app/services/id_card/` — preprocessing, TF inference, homography, cropper
-- `app/services/face/verification.py` — VGGFace2 wrapper
-- `app/services/storage/temp.py` — temp file lifecycle
+### Immediate
+- `tasks/liveliness.py` — finish blink / orientation / emotion dispatch wiring for the `kyc_full` tier
 
-### Near-term
-- Object storage (MinIO/S3) — `SubmitRequest.SelfieURL` and `IDCardURL` already in the Go struct; Python service reads images by URL instead of multipart bytes
-- ONNX export — `frozen_model.pb` → `dsnt.onnx`, VGGFace2 PyTorch → `vggface2.onnx`; removes TF and cuts the container from ~4GB to ~600MB
+### Recently completed
+- **Object storage (Cloudflare R2)** — client uploads directly to R2 via the SvelteKit backend; presigned GET URLs flow through Go's `KYCJob` and `kycclient.VerifyRequest`/`SmartCropRequest` as strings, never as bytes; Python's `/id-card` and `/verify` fetch bytes server-side via `utils/temp.fetch_bytes()` instead of accepting multipart uploads
+- **Concurrency-safe `/verify`** — removed the "fall back to last `/id-card` output" temp-slot pattern, since the worker pool calls Python concurrently and that shared state wasn't request-scoped; `/verify` now rectifies the ID card fresh on every call
 
 ### Future
+- ONNX export — legacy TF keypoint model → ONNX, VGGFace2 PyTorch → `vggface2.onnx`; removes any remaining TF dependency and shrinks the container
 - Hyperledger Fabric enrollment trigger on `StatusApproved`
 - H3 geospatial tagging of KYC jobs for regional analytics
 - Multi-GPU routing — Go semaphore routes to specific Python replicas by GPU affinity
+
+### Citation
+Please cite this paper, if using midv dataset, link for dataset provided in paper
+
+    @article{DBLP:journals/corr/abs-1807-05786,
+      author    = {Vladimir V. Arlazarov and
+                   Konstantin Bulatov and
+                   Timofey S. Chernov and
+                   Vladimir L. Arlazarov},
+      title     = {{MIDV-500:} {A} Dataset for Identity Documents Analysis and Recognition
+                   on Mobile Devices in Video Stream},
+      journal   = {CoRR},
+      volume    = {abs/1807.05786},
+      year      = {2018},
+      url       = {http://arxiv.org/abs/1807.05786},
+      archivePrefix = {arXiv},
+      eprint    = {1807.05786},
+      timestamp = {Mon, 13 Aug 2018 16:46:35 +0200},
+      biburl    = {https://dblp.org/rec/bib/journals/corr/abs-1807-05786},
+      bibsource = {dblp computer science bibliography, https://dblp.org}
+    }

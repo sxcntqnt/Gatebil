@@ -247,44 +247,37 @@ func (p *Pool) processOnce(ctx context.Context, job domain.KYCJob, attempt int) 
 
 // runInference calls the appropriate KYCClient methods based on job tier.
 func (p *Pool) runInference(ctx context.Context, job domain.KYCJob) (*domain.KYCResult, error) {
-	// NOTE: at this layer the worker has metadata only.
-	// Image bytes come from the submit path — stored in object storage (future)
-	// or passed in-band (current multipart flow). For now we pass empty bytes
-	// and rely on the Python service having the images from the prior /id-card call.
-	// This will be replaced cleanly when the object-storage URL pattern lands.
-	req := kycclient.VerifyRequest{
-		// SelfieURL / IDCardURL will replace these once MinIO is wired.
-		SelfieBytes: nil, // TODO: fetch from object store by job.ID
-		IDCardBytes: nil,
-	}
+        req := kycclient.VerifyRequest{
+                SelfieURL: job.SelfieURL,
+                IDCardURL: job.IDCardURL,
+        }
 
-	verifyResult, err := p.kycClient.Verify(ctx, req)
-	if err != nil {
-		if isBackpressure(err) {
-			return nil, domain.ErrBackpressure
-		}
-		if isTimeout(err) {
-			return nil, domain.ErrInferenceTimeout
-		}
-		return nil, err
-	}
+        verifyResult, err := p.kycClient.Verify(ctx, req)
+        if err != nil {
+                if isBackpressure(err) {
+                        return nil, domain.ErrBackpressure
+                }
+                if isTimeout(err) {
+                        return nil, domain.ErrInferenceTimeout
+                }
+                return nil, err
+        }
 
-	status := domain.StatusRejected
-	if verifyResult.Verified {
-		status = domain.StatusApproved
-	}
+        status := domain.StatusRejected
+        if verifyResult.Verified {
+                status = domain.StatusApproved
+        }
 
-	return &domain.KYCResult{
-		JobID:           job.ID,
-		UserID:          job.UserID,
-		Status:          status,
-		InternalJobID:   verifyResult.InternalJobID,
-		Confidence:      verifyResult.Score,
-		ModelVersion:    verifyResult.ModelVersion,
-		LivenessVersion: verifyResult.LivenessVersion,
-	}, nil
+        return &domain.KYCResult{
+                JobID:           job.ID,
+                UserID:          job.UserID,
+                Status:          status,
+                InternalJobID:   verifyResult.InternalJobID,
+                Confidence:      verifyResult.Score,
+                ModelVersion:    verifyResult.ModelVersion,
+                LivenessVersion: verifyResult.LivenessVersion,
+        }, nil
 }
-
 // ── Terminal state helpers ────────────────────────────────────────────────────
 
 func (p *Pool) finalise(ctx context.Context, job domain.KYCJob, status domain.KYCStatus, verifyResult *kycclient.VerifyResult, errMsg string) {

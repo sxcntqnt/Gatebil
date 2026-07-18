@@ -29,6 +29,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import httpx
 
 from core.config import settings
 from core.exceptions import StorageError
@@ -134,3 +135,23 @@ def purge_stale() -> int:
     if deleted:
         log.info("purged stale temp files", extra={"count": deleted})
     return deleted
+
+
+# ── Fetch (new) ──────────────────────────────────────────────────────────────
+
+async def fetch_bytes(url: str) -> bytes:
+    """
+    Download image bytes from a presigned URL (R2, or any HTTPS source).
+
+    Used now that Go passes selfie_url / id_card_url instead of multipart
+    bytes — this is the one place in the service that reaches out to object
+    storage, matching the "storage strategy changes in one place" contract
+    this module already promises.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise StorageError(f"Failed to fetch image from URL: {exc}") from exc
+    return resp.content

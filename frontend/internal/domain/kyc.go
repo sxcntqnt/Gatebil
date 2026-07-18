@@ -53,17 +53,19 @@ const (
 
 // KYCJob is the unit of work queued to the worker pool.
 type KYCJob struct {
-	ID              string    `json:"id"`               // UUID v4
-	IdempotencyKey  string    `json:"idempotency_key"`  // caller-supplied dedup key
-	UserID          string    `json:"user_id"`
-	CountryCode     string    `json:"country_code"`     // "KE", "NG", "GH"
-	IDType          IDType    `json:"id_type"`
-	IDNumber        string    `json:"id_number"`
-	FirstName       string    `json:"first_name"`
-	LastName        string    `json:"last_name"`
-	Tier            KYCTier   `json:"tier"`
-	Attempt         int       `json:"attempt"`          // retry counter
-	SubmittedAt     time.Time `json:"submitted_at"`
+        ID              string    `json:"id"`               // UUID v4
+        IdempotencyKey  string    `json:"idempotency_key"`  // caller-supplied dedup key
+        UserID          string    `json:"user_id"`
+        CountryCode     string    `json:"country_code"`     // "KE", "NG", "GH"
+        IDType          IDType    `json:"id_type"`
+        IDNumber        string    `json:"id_number"`
+        FirstName       string    `json:"first_name"`
+        LastName        string    `json:"last_name"`
+        Tier            KYCTier   `json:"tier"`
+        SelfieURL       string    `json:"selfie_url"`       // presigned R2 GET URL, set at submit time
+        IDCardURL       string    `json:"id_card_url"`      // presigned R2 GET URL, set at submit time
+        Attempt         int       `json:"attempt"`          // retry counter
+        SubmittedAt     time.Time `json:"submitted_at"`
 }
 
 // KYCResult is the persisted outcome of a completed job.

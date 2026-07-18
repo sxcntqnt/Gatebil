@@ -42,7 +42,7 @@ type Config struct {
 // Load reads configuration from environment variables and validates required fields.
 func Load() (*Config, error) {
 	cfg := &Config{
-		Port:            getEnv("PORT", "8080"),
+		Port:            getEnv("PORT", "9930"),
 		ReadTimeout:     getDuration("READ_TIMEOUT", 10*time.Second),
 		WriteTimeout:    getDuration("WRITE_TIMEOUT", 30*time.Second),
 		ShutdownTimeout: getDuration("SHUTDOWN_TIMEOUT", 15*time.Second),

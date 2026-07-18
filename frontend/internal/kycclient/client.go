@@ -14,6 +14,7 @@ import (
 	"io"
 	"log/slog"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -48,10 +49,8 @@ type KYCClient interface {
 // ──────────────────────────────────────────────────
 
 type VerifyRequest struct {
-	SelfieBytes  []byte // raw image bytes (multipart today; URL tomorrow)
-	IDCardBytes  []byte // omit to reuse last SmartCrop result on the Python side
-	SelfieURL    string // future: pass object-storage URL instead of bytes
-	IDCardURL    string
+        SelfieURL string // presigned R2 URL — required
+        IDCardURL string // presigned R2 URL — omit to reuse last SmartCrop result on the Python side
 }
 
 type VerifyResult struct {
@@ -74,7 +73,7 @@ type ChallengeResult struct {
 }
 
 type SmartCropRequest struct {
-	IDCardBytes []byte
+        IDCardURL string // presigned R2 URL
 }
 
 type SmartCropResult struct {
@@ -191,13 +190,33 @@ func New(cfg Config, logger *slog.Logger) *PythonClient {
 	if cfg.Concurrency < 1 {
 		cfg.Concurrency = 10
 	}
+
+	httpClient := &http.Client{
+		Timeout: cfg.Timeout + 2*time.Second,
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   3 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+
+			ForceAttemptHTTP2:     false,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   5 * time.Second,
+			ResponseHeaderTimeout: 5 * time.Second,
+
+			// prevents "infinite connect stalls"
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+	}
+
 	return &PythonClient{
-		base:    cfg.BaseURL,
-		timeout: cfg.Timeout,
-		http:    &http.Client{Timeout: cfg.Timeout + 2*time.Second}, // outer safety net
-		sem:     make(chan struct{}, cfg.Concurrency),
-		breaker: newCircuitBreaker(5, 30*time.Second),
-		logger:  logger,
+		base:     cfg.BaseURL,
+		timeout:  cfg.Timeout,
+		http:     httpClient,
+		sem:      make(chan struct{}, cfg.Concurrency),
+		breaker:  newCircuitBreaker(5, 30*time.Second),
+		logger:   logger,
 	}
 }
 
@@ -261,6 +280,41 @@ func (c *PythonClient) post(ctx context.Context, path string, fields map[string]
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
+// postJSON sends a JSON request and decodes the JSON response into out.
+// Used for the URL-based routes (/verify, /id-card) now that images live
+// in R2 rather than crossing the wire as multipart bytes.
+func (c *PythonClient) postJSON(ctx context.Context, path string, payload interface{}, out interface{}) error {
+        tctx, cancel := context.WithTimeout(ctx, c.timeout)
+        defer cancel()
+
+        body, err := json.Marshal(payload)
+        if err != nil {
+                return fmt.Errorf("marshal payload: %w", err)
+        }
+
+        req, err := http.NewRequestWithContext(tctx, http.MethodPost, c.base+path, bytes.NewReader(body))
+        if err != nil {
+                return err
+        }
+        req.Header.Set("Content-Type", "application/json")
+
+        resp, err := c.http.Do(req)
+        if err != nil {
+                c.breaker.recordFailure()
+                return fmt.Errorf("http: %w", err)
+        }
+        defer resp.Body.Close()
+
+        if resp.StatusCode >= 500 {
+                c.breaker.recordFailure()
+                raw, _ := io.ReadAll(resp.Body)
+                return fmt.Errorf("python service %d: %s", resp.StatusCode, raw)
+        }
+
+        c.breaker.recordSuccess()
+        return json.NewDecoder(resp.Body).Decode(out)
+}
+
 func (c *PythonClient) get(ctx context.Context, path string, out interface{}) error {
 	tctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
@@ -278,25 +332,31 @@ func (c *PythonClient) get(ctx context.Context, path string, out interface{}) er
 }
 
 // ── KYCClient implementation ─────────────────────────────────────────────────
-
 func (c *PythonClient) Verify(ctx context.Context, req VerifyRequest) (*VerifyResult, error) {
-	release, err := c.gate(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer release()
+        release, err := c.gate(ctx)
+        if err != nil {
+                return nil, err
+        }
+        defer release()
 
-	fields := map[string][]byte{"selfie": req.SelfieBytes}
-	if req.IDCardBytes != nil {
-		fields["id_image"] = req.IDCardBytes
-	}
+        if req.SelfieURL == "" {
+                return nil, fmt.Errorf("kycclient: Verify requires SelfieURL")
+        }
 
-	var out VerifyResult
-	if err := c.post(ctx, "/internal/v1/verify", fields, &out); err != nil {
-		c.logger.Error("verify call failed", "err", err)
-		return nil, err
-	}
-	return &out, nil
+        payload := struct {
+                SelfieURL string `json:"selfie_url"`
+                IDCardURL string `json:"id_card_url,omitempty"`
+        }{
+                SelfieURL: req.SelfieURL,
+                IDCardURL: req.IDCardURL,
+        }
+
+        var out VerifyResult
+        if err := c.postJSON(ctx, "/internal/v1/verify", payload, &out); err != nil {
+                c.logger.Error("verify call failed", "err", err)
+                return nil, err
+        }
+        return &out, nil
 }
 
 func (c *PythonClient) Challenge(ctx context.Context, req ChallengeRequest) (*ChallengeResult, error) {
@@ -347,20 +407,26 @@ func (c *PythonClient) postChallenge(ctx context.Context, req ChallengeRequest, 
 }
 
 func (c *PythonClient) SmartCrop(ctx context.Context, req SmartCropRequest) (*SmartCropResult, error) {
-	release, err := c.gate(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer release()
+        release, err := c.gate(ctx)
+        if err != nil {
+                return nil, err
+        }
+        defer release()
 
-	fields := map[string][]byte{"file": req.IDCardBytes}
-	var out SmartCropResult
-	if err := c.post(ctx, "/internal/v1/id-card", fields, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+        if req.IDCardURL == "" {
+                return nil, fmt.Errorf("kycclient: SmartCrop requires IDCardURL")
+        }
+
+        payload := struct {
+                IDCardURL string `json:"id_card_url"`
+        }{IDCardURL: req.IDCardURL}
+
+        var out SmartCropResult
+        if err := c.postJSON(ctx, "/internal/v1/id-card", payload, &out); err != nil {
+                return nil, err
+        }
+        return &out, nil
 }
-
 func (c *PythonClient) Health(ctx context.Context) error {
 	var out struct {
 		OK bool `json:"ok"`

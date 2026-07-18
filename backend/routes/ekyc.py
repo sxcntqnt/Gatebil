@@ -3,11 +3,11 @@ app.routes.ekyc
 ───────────────
 Mounted at  POST /internal/v1/id-card
 
-Accepts a raw ID card image and returns the smart-cropped face region
-using the DSNT TF keypoint model + homography warp.
-
-The cropped result is written to the temp store so the downstream
-/verify endpoint can reference it without re-sending the image.
+Standalone preview/debug endpoint: fetches an ID card image by URL and
+returns the perspective-corrected crop. Not used by /verify anymore —
+that route rectifies its own copy per-request rather than depending on
+this endpoint's temp output, since shared temp state isn't safe under
+concurrent requests.
 """
 from __future__ import annotations
 
@@ -15,15 +15,17 @@ import asyncio
 import logging
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, UploadFile
+import cv2
+from fastapi import APIRouter, Depends
 
 from api.dependency import get_id_detector
+from core.exceptions import StorageError
 from model.id_detector import IDDetector
-from model.schemas import SmartCropResponse
+from model.schemas import SmartCropRequest, SmartCropResponse
 from services.id_card.ekyc import process_id_card
+from utils import temp
 
 log = logging.getLogger(__name__)
-
 router = APIRouter()
 # No prefix — /internal/v1 is applied by main.py's _register_routers.
 
@@ -32,29 +34,38 @@ router = APIRouter()
     "/id-card",
     response_model=SmartCropResponse,
     summary="Smart-crop ID card",
-    description=(
-        "Upload a raw ID card photo (landscape, phone capture). "
-        "Returns paths to the perspective-corrected crop and the final scaled image, "
-        "plus the raw corner keypoints for debugging."
-    ),
+    description="Fetch an ID card image by URL and return the perspective-corrected crop.",
 )
 async def upload_id_card(
-    file: UploadFile = File(..., description="ID card image (JPEG or PNG)"),
+    body: SmartCropRequest,
     detector: Annotated[IDDetector, Depends(get_id_detector)] = None,
 ) -> SmartCropResponse:
-    """
-    Pipeline: decode → rotate → resize → DSNT keypoints → homography → write temp.
-
-    Heavy numpy / cv2 / TF work is pushed off the event loop via asyncio.to_thread
-    so FastAPI's async machinery is not blocked during inference.
-    """
-    image_bytes = await file.read()
+    image_bytes = await temp.fetch_bytes(str(body.id_card_url))
 
     result = await asyncio.to_thread(
         process_id_card,
-        image_bytes=image_bytes,
-        detector=detector,
+        image_bytes,
+        detector,
     )
 
-    log.info("id-card processed", extra={"final_path": result["final_path"]})
-    return SmartCropResponse(**result)
+    if not result.success:
+        raise StorageError(f"ID card rectification failed: {result.error}")
+
+    # rectified_image is RGB (per ekyc.py's _load_image contract);
+    # temp.write_bgr expects BGR (cv2.imwrite convention) — convert first.
+    bgr_image = cv2.cvtColor(result.rectified_image, cv2.COLOR_RGB2BGR)
+
+    cropped_path = temp.write_bgr("cropped", bgr_image)
+    final_path = temp.write_bgr("final", bgr_image)
+
+    keypoints = [
+        [int(x), int(y)]
+        for x, y in result.keypoints.corner_points().tolist()
+    ]
+
+    log.info("id-card processed", extra={"final_path": str(final_path)})
+    return SmartCropResponse(
+        cropped_path=str(cropped_path),
+        final_path=str(final_path),
+        keypoints=keypoints,
+    )

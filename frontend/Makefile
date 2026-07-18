@@ -7,7 +7,7 @@ build:
 	go build -o bin/$(APP) $(CMD)
 
 run:
-	go run $(CMD)
+	./bin/$(APP)
 
 test:
 	go test ./... -v -race -count=1
