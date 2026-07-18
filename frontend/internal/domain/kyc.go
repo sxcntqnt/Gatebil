@@ -3,8 +3,8 @@
 package domain
 
 import (
-	"errors"
-	"time"
+        "errors"
+        "time"
 )
 
 // ──────────────────────────────────────────────────
@@ -15,11 +15,11 @@ import (
 type KYCStatus string
 
 const (
-	StatusPending    KYCStatus = "pending"    // queued, not yet dispatched
-	StatusProcessing KYCStatus = "processing" // worker picked it up
-	StatusApproved   KYCStatus = "approved"   // inference returned verified
-	StatusRejected   KYCStatus = "rejected"   // inference returned not verified
-	StatusFailed     KYCStatus = "failed"     // transient error after all retries
+        StatusPending    KYCStatus = "pending"    // queued, not yet dispatched
+        StatusProcessing KYCStatus = "processing" // worker picked it up
+        StatusApproved   KYCStatus = "approved"   // inference returned verified
+        StatusRejected   KYCStatus = "rejected"   // inference returned not verified
+        StatusFailed     KYCStatus = "failed"     // transient error after all retries
 )
 
 // ──────────────────────────────────────────────────
@@ -29,11 +29,11 @@ const (
 type IDType string
 
 const (
-	IDTypeNationalID IDType = "NATIONAL_ID"
-	IDTypeAlienID    IDType = "ALIEN_ID"
-	IDTypePassport   IDType = "PASSPORT"
-	IDTypeVoterID    IDType = "VOTER_ID"
-	IDTypeDrivingLic IDType = "DRIVING_LICENSE"
+        IDTypeNationalID IDType = "NATIONAL_ID"
+        IDTypeAlienID    IDType = "ALIEN_ID"
+        IDTypePassport   IDType = "PASSPORT"
+        IDTypeVoterID    IDType = "VOTER_ID"
+        IDTypeDrivingLic IDType = "DRIVING_LICENSE"
 )
 
 // ──────────────────────────────────────────────────
@@ -43,8 +43,8 @@ const (
 type KYCTier string
 
 const (
-	TierLight KYCTier = "kyc_light" // passengers / low-risk
-	TierFull  KYCTier = "kyc_full"  // operators / crew / NTSA-grade
+        TierLight KYCTier = "kyc_light" // passengers / low-risk
+        TierFull  KYCTier = "kyc_full"  // operators / crew / NTSA-grade
 )
 
 // ──────────────────────────────────────────────────
@@ -62,6 +62,7 @@ type KYCJob struct {
         FirstName       string    `json:"first_name"`
         LastName        string    `json:"last_name"`
         Tier            KYCTier   `json:"tier"`
+        Status          KYCStatus `json:"status"`           // job lifecycle state; was missing, silently dropped on every read
         SelfieURL       string    `json:"selfie_url"`       // presigned R2 GET URL, set at submit time
         IDCardURL       string    `json:"id_card_url"`      // presigned R2 GET URL, set at submit time
         Attempt         int       `json:"attempt"`          // retry counter
@@ -70,32 +71,32 @@ type KYCJob struct {
 
 // KYCResult is the persisted outcome of a completed job.
 type KYCResult struct {
-	JobID           string    `json:"job_id"`
-	UserID          string    `json:"user_id"`
-	Status          KYCStatus `json:"status"`
-	InternalJobID   string    `json:"internal_job_id,omitempty"`  // ref inside Python service
-	ResultText      string    `json:"result_text,omitempty"`
-	ResultCode      string    `json:"result_code,omitempty"`
-	Confidence      float64   `json:"confidence,omitempty"`
-	ModelVersion    string    `json:"model_version,omitempty"`    // e.g. "vggface2-2026.05"
-	LivenessVersion string    `json:"liveness_version,omitempty"` // e.g. "liveness-trinity-v2"
-	ErrorMsg        string    `json:"error,omitempty"`
-	ProcessedAt     time.Time `json:"processed_at"`
-	Attempt         int       `json:"attempt"`
+        JobID           string    `json:"job_id"`
+        UserID          string    `json:"user_id"`
+        Status          KYCStatus `json:"status"`
+        InternalJobID   string    `json:"internal_job_id,omitempty"`  // ref inside Python service
+        ResultText      string    `json:"result_text,omitempty"`
+        ResultCode      string    `json:"result_code,omitempty"`
+        Confidence      float64   `json:"confidence,omitempty"`
+        ModelVersion    string    `json:"model_version,omitempty"`    // e.g. "vggface2-2026.05"
+        LivenessVersion string    `json:"liveness_version,omitempty"` // e.g. "liveness-trinity-v2"
+        ErrorMsg        string    `json:"error,omitempty"`
+        ProcessedAt     time.Time `json:"processed_at"`
+        Attempt         int       `json:"attempt"`
 }
 
 // KYCStatusResponse is the HTTP response shape for status queries.
 type KYCStatusResponse struct {
-	JobID           string    `json:"job_id"`
-	UserID          string    `json:"user_id"`
-	Status          KYCStatus `json:"status"`
-	Tier            KYCTier   `json:"tier,omitempty"`
-	ResultText      string    `json:"result_text,omitempty"`
-	Confidence      float64   `json:"confidence,omitempty"`
-	ModelVersion    string    `json:"model_version,omitempty"`
-	LivenessVersion string    `json:"liveness_version,omitempty"`
-	ProcessedAt     time.Time `json:"processed_at,omitempty"`
-	SubmittedAt     time.Time `json:"submitted_at"`
+        JobID           string    `json:"job_id"`
+        UserID          string    `json:"user_id"`
+        Status          KYCStatus `json:"status"`
+        Tier            KYCTier   `json:"tier,omitempty"`
+        ResultText      string    `json:"result_text,omitempty"`
+        Confidence      float64   `json:"confidence,omitempty"`
+        ModelVersion    string    `json:"model_version,omitempty"`
+        LivenessVersion string    `json:"liveness_version,omitempty"`
+        ProcessedAt     time.Time `json:"processed_at,omitempty"`
+        SubmittedAt     time.Time `json:"submitted_at"`
 }
 
 // ──────────────────────────────────────────────────
@@ -103,14 +104,14 @@ type KYCStatusResponse struct {
 // ──────────────────────────────────────────────────
 
 var (
-	ErrJobNotFound      = errors.New("kyc job not found")
-	ErrDuplicateJob     = errors.New("active kyc job already exists for this user")
-	ErrIdempotentReplay = errors.New("idempotency key already used — replaying prior result")
-	ErrInvalidIDType    = errors.New("unsupported ID type for the given country")
-	ErrQueueFull        = errors.New("kyc worker queue is at capacity, try again shortly")
-	ErrJobAlreadyDone   = errors.New("kyc job is already in a terminal state")
-	ErrBackpressure     = errors.New("inference service is at concurrency limit, backing off")
-	ErrInferenceTimeout = errors.New("inference service did not respond within deadline")
+        ErrJobNotFound      = errors.New("kyc job not found")
+        ErrDuplicateJob     = errors.New("active kyc job already exists for this user")
+        ErrIdempotentReplay = errors.New("idempotency key already used — replaying prior result")
+        ErrInvalidIDType    = errors.New("unsupported ID type for the given country")
+        ErrQueueFull        = errors.New("kyc worker queue is at capacity, try again shortly")
+        ErrJobAlreadyDone   = errors.New("kyc job is already in a terminal state")
+        ErrBackpressure     = errors.New("inference service is at concurrency limit, backing off")
+        ErrInferenceTimeout = errors.New("inference service did not respond within deadline")
 )
 
 // ──────────────────────────────────────────────────
@@ -119,25 +120,25 @@ var (
 
 // AllowedIDTypes maps country → accepted ID types for quick validation.
 var AllowedIDTypes = map[string]map[IDType]bool{
-	"KE": {
-		IDTypeNationalID: true,
-		IDTypeAlienID:    true,
-		IDTypePassport:   true,
-	},
-	"NG": {
-		IDTypeNationalID: true, // NIN
-		IDTypePassport:   true,
-		IDTypeVoterID:    true,
-	},
-	"GH": {
-		IDTypeNationalID: true,
-		IDTypePassport:   true,
-		IDTypeVoterID:    true,
-		IDTypeDrivingLic: true,
-	},
+        "KE": {
+                IDTypeNationalID: true,
+                IDTypeAlienID:    true,
+                IDTypePassport:   true,
+        },
+        "NG": {
+                IDTypeNationalID: true, // NIN
+                IDTypePassport:   true,
+                IDTypeVoterID:    true,
+        },
+        "GH": {
+                IDTypeNationalID: true,
+                IDTypePassport:   true,
+                IDTypeVoterID:    true,
+                IDTypeDrivingLic: true,
+        },
 }
 
 // IsTerminal reports whether a status needs no further processing.
 func (s KYCStatus) IsTerminal() bool {
-	return s == StatusApproved || s == StatusRejected || s == StatusFailed
+        return s == StatusApproved || s == StatusRejected || s == StatusFailed
 }
