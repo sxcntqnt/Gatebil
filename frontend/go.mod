@@ -5,7 +5,6 @@ go 1.26.1
 require (
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.9.2
-	github.com/nutcas3/smileid-go v0.0.0
 	github.com/prometheus/client_golang v1.21.1
 )
 
@@ -20,11 +19,8 @@ require (
 	github.com/prometheus/client_model v0.6.1 // indirect
 	github.com/prometheus/common v0.62.0 // indirect
 	github.com/prometheus/procfs v0.15.1 // indirect
-	golang.org/x/crypto v0.45.0 // indirect
 	golang.org/x/sync v0.18.0 // indirect
 	golang.org/x/sys v0.38.0 // indirect
 	golang.org/x/text v0.31.0 // indirect
 	google.golang.org/protobuf v1.36.1 // indirect
 )
-
-replace github.com/nutcas3/smileid-go => ./smileid-go
