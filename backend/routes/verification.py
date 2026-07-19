@@ -18,7 +18,7 @@ import cv2
 from fastapi import APIRouter, Depends
 
 from api.dependency import get_mtcnn, get_verif_model, get_id_detector
-from core.exceptions import StorageError
+from core.exceptions import StorageError, IDCardProcessingError  
 from model.id_detector import IDDetector
 from model.schemas import VerifyRequest, VerifyResponse
 from services.id_card.ekyc import process_id_card  # NOTE: confirm this path — routes/ekyc.py
@@ -58,7 +58,8 @@ async def verify(
         detector,
     )
     if not ekyc_result.success:
-        raise StorageError(f"ID card rectification failed: {ekyc_result.error}")
+        raise IDCardProcessingError(f"ID card rectification failed: {ekyc_result.error}")
+
 
     # rectified_image is RGB uint8 — re-encode to JPEG bytes since
     # verify_faces/bytes_to_bgr expects an encoded image, not a raw array.

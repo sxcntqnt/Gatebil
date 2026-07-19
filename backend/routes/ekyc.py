@@ -19,7 +19,7 @@ import cv2
 from fastapi import APIRouter, Depends
 
 from api.dependency import get_id_detector
-from core.exceptions import StorageError
+from core.exceptions import IDCardProcessingError  
 from model.id_detector import IDDetector
 from model.schemas import SmartCropRequest, SmartCropResponse
 from services.id_card.ekyc import process_id_card
@@ -49,7 +49,7 @@ async def upload_id_card(
     )
 
     if not result.success:
-        raise StorageError(f"ID card rectification failed: {result.error}")
+        raise IDCardProcessingError(f"ID card rectification failed: {result.error}")
 
     # rectified_image is RGB (per ekyc.py's _load_image contract);
     # temp.write_bgr expects BGR (cv2.imwrite convention) — convert first.
