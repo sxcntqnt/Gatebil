@@ -58,10 +58,9 @@ async def upload_id_card(
     cropped_path = temp.write_bgr("cropped", bgr_image)
     final_path = temp.write_bgr("final", bgr_image)
 
-    keypoints = [
-        [int(x), int(y)]
-        for x, y in result.keypoints.corner_points().tolist()
-    ]
+    # result.quad is ordered TL, TR, BR, BL regardless of the checkpoint's
+    # channel order (corner_points() would return raw channel order).
+    keypoints = [[int(x), int(y)] for x, y in result.quad.tolist()]
 
     log.info("id-card processed", extra={"final_path": str(final_path)})
     return SmartCropResponse(

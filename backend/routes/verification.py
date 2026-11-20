@@ -21,9 +21,7 @@ from api.dependency import get_mtcnn, get_verif_model, get_id_detector
 from core.exceptions import StorageError, IDCardProcessingError  
 from model.id_detector import IDDetector
 from model.schemas import VerifyRequest, VerifyResponse
-from services.id_card.ekyc import process_id_card  # NOTE: confirm this path — routes/ekyc.py
-                                            # imports from services.id_card.ekyc instead;
-                                            # only one of these matches your real layout
+from services.id_card.ekyc import orient_card_by_face, process_id_card
 from tasks.verification import verify_faces
 from utils import temp
 
@@ -63,7 +61,12 @@ async def verify(
 
     # rectified_image is RGB uint8 — re-encode to JPEG bytes since
     # verify_faces/bytes_to_bgr expects an encoded image, not a raw array.
-    id_face_bytes = _encode_rgb_to_jpeg_bytes(ekyc_result.rectified_image)
+    # The quad is landscape but may still be upside down; keep the rotation
+    # in which MTCNN finds a face (unchanged if none is found).
+    card_rgb, _rot, _score = await asyncio.to_thread(
+        orient_card_by_face, ekyc_result.rectified_image, mtcnn
+    )
+    id_face_bytes = _encode_rgb_to_jpeg_bytes(card_rgb)
 
     result = await asyncio.to_thread(
         verify_faces,
