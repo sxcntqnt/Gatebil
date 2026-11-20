@@ -620,6 +620,15 @@ class IDDetector:
         confidence = output.confidence[0].cpu().numpy()  # (C,)
         heatmaps = output.heatmaps[0].cpu().numpy()      # (C, H_hm, W_hm)
 
+        log.info(
+            "ID detector output",
+            extra={
+                "confidence": confidence.tolist(),
+                "threshold": self.confidence_threshold,
+                "coords_norm": coords_norm.tolist(),
+            },
+        )
+
         valid = confidence >= self.confidence_threshold
 
         return KeypointResult(
